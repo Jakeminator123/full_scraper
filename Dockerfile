@@ -27,8 +27,9 @@ COPY . .
 
 # ── Runtime configuration ────────────────────────────────────────────────────
 ENV DATA_DIR=/var/data
-ENV PAGE_PAUSE=0.5
-ENV BATCH_SIZE=20
+ENV PAGE_PAUSE=0.3
+ENV BATCH_SIZE=15
+ENV PARALLEL_WORKERS=5
 ENV START_YEAR=1940
 ENV END_YEAR=2005
 ENV AUTO_RESUME=true

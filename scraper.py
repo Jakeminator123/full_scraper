@@ -1,17 +1,19 @@
 """
-scraper.py — Systematic PNR enumeration scraper for biluppgifter.se
+scraper.py — Two-phase population scraper for biluppgifter.se
 
-Strategy:
-  Enumerate ALL valid Swedish PNRs in the range [START_YEAR, END_YEAR] in order:
-    year -> month -> day (1-28) -> individ (1-999)
-  For each position, compute the Luhn check digit to get a valid PNR, then
-  fetch /brukare/base64(PNR)/ to check if the person exists in biluppgifter's DB.
+Phase 1 (FAST — ~1-2 days):
+  Enumerate all 17,576 three-letter vehicle prefixes (AAA-ZZZ).
+  Each prefix page returns 100 vehicles. Paginate until exhausted.
+  For each vehicle: extract regnr, model, year, status, vehicleId.
+  For vehicles with vehicleId: the owner's brukare link exists.
+  → Covers ~11.4M vehicles and their owners.
 
-  The position is checkpointed to SQLite after each batch, so the job can be
-  paused and resumed at any time — even after a container restart.
+Phase 2 (SLOWER — parallel PNR enumeration):
+  Generate valid PNRs via Luhn algorithm, fetch /brukare/base64(PNR)/.
+  Runs N parallel Playwright workers for speed.
+  → Fills in people WITHOUT vehicles (~60% of population).
 
-  Total enumeration space (1940-2005): 66 x 12 x 28 x 999 ~ 22.2M PNRs
-  Expected hit rate: ~37%  ->  ~8.2M people found
+Both phases checkpoint to SQLite for resume after restart.
 """
 
 import os
@@ -21,8 +23,10 @@ import json
 import subprocess
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Generator
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -30,13 +34,14 @@ import db
 
 log = logging.getLogger("scraper")
 
-BASE        = "https://biluppgifter.se"
-APP_DIR     = os.path.dirname(os.path.abspath(__file__))
-FETCH_JS    = os.path.join(APP_DIR, "fetch_helper.js")
-PAGE_PAUSE  = float(os.environ.get("PAGE_PAUSE",  "0.5"))
-BATCH_SIZE  = int(os.environ.get("BATCH_SIZE",    "20"))
-START_YEAR  = int(os.environ.get("START_YEAR",    "1940"))
-END_YEAR    = int(os.environ.get("END_YEAR",      "2005"))
+BASE             = "https://biluppgifter.se"
+APP_DIR          = os.path.dirname(os.path.abspath(__file__))
+FETCH_JS         = os.path.join(APP_DIR, "fetch_helper.js")
+PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.3"))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "15"))
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "5"))
+START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
+END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
 
 _thread:     threading.Thread | None = None
 _stop_event: threading.Event          = threading.Event()
@@ -44,7 +49,7 @@ _state_lock: threading.Lock           = threading.Lock()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PNR generation (Luhn algorithm)
+#  Luhn PNR generation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _luhn_check(nine_digits: str) -> int:
@@ -82,15 +87,15 @@ def _pnr_to_url(pnr: str) -> str:
 #  PNR enumeration — systematic, resumable
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _total_size(start_year: int, end_year: int) -> int:
+def _total_pnr_space(start_year: int, end_year: int) -> int:
     return (end_year - start_year + 1) * 12 * 28 * 999
 
 
-def _position_index(year: int, month: int, day: int, individ: int, start_year: int) -> int:
+def _pnr_position_index(year: int, month: int, day: int, individ: int, start_year: int) -> int:
     return (
-        (year  - start_year) * 12 * 28 * 999
-        + (month - 1)         * 28 * 999
-        + (day   - 1)         *      999
+        (year - start_year) * 12 * 28 * 999
+        + (month - 1) * 28 * 999
+        + (day - 1) * 999
         + (individ - 1)
     )
 
@@ -100,14 +105,8 @@ def _iter_pnrs(
     end_year: int,
     resume: tuple[int, int, int, int] | None = None,
 ) -> Generator[tuple[int, int, int, int, str], None, None]:
-    """
-    Yield (year, month, day, individ, pnr) for every valid PNR in range.
-    If resume is given, skip to the NEXT position after the checkpoint
-    (the checkpointed position itself was already processed).
-    """
     if resume:
         ry, rm, rd, ri = resume
-        # Advance one step past the checkpoint (it was already processed)
         ri += 1
         if ri > 999:
             ri = 1; rd += 1
@@ -131,56 +130,100 @@ def _iter_pnrs(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HTTP fetch via Playwright (Node.js subprocess)
+#  Prefix enumeration (AAA-ZZZ) for Phase 1
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_batch(pnr_list: list[str]) -> dict[str, str | None]:
-    url_map = {}
-    for pnr in pnr_list:
-        url = _pnr_to_url(pnr)
-        url_map[url] = pnr
+TOTAL_PREFIXES = 26 ** 3  # 17,576
 
+
+def _iter_prefixes(resume_prefix: str = "") -> Generator[str, None, None]:
+    """Yield all 3-letter prefixes AAA..ZZZ, optionally resuming."""
+    started = not bool(resume_prefix)
+    for a in range(26):
+        for b in range(26):
+            for c in range(26):
+                prefix = chr(65+a) + chr(65+b) + chr(65+c)
+                if not started:
+                    if prefix == resume_prefix:
+                        started = True
+                    continue
+                yield prefix
+
+
+def _prefix_page_url(prefix: str, page: int) -> str:
+    if page == 1:
+        return f"{BASE}/fordon/{prefix}/"
+    return f"{BASE}/fordon/{prefix}/{page}/"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTTP fetch — single worker (one Playwright/Chromium process)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_batch(url_list: list[str]) -> dict[str, str | None]:
+    """Run fetch_helper.js with a batch of URLs. Returns {url: html|None}."""
+    if not url_list:
+        return {}
     try:
         r = subprocess.run(
             ["node", FETCH_JS, "--stdin"],
-            input=json.dumps(list(url_map.keys())),
+            input=json.dumps(url_list),
             capture_output=True,
             text=True,
-            timeout=int(PAGE_PAUSE * len(pnr_list) * 3 + 120),
+            timeout=int(PAGE_PAUSE * len(url_list) * 3 + 90),
             cwd=APP_DIR,
         )
         if r.returncode != 0:
             log.warning("fetch_helper error: %s", r.stderr.strip()[:200])
-            return {p: None for p in pnr_list}
-        html_by_url = json.loads(r.stdout)
-        return {url_map[u]: h for u, h in html_by_url.items()}
+            return {u: None for u in url_list}
+        return json.loads(r.stdout)
     except subprocess.TimeoutExpired:
-        log.warning("fetch_helper timeout for batch of %d", len(pnr_list))
-        return {p: None for p in pnr_list}
+        log.warning("fetch_helper timeout for %d urls", len(url_list))
+        return {u: None for u in url_list}
     except Exception as e:
         log.error("fetch_helper exception: %s", e)
-        return {p: None for p in pnr_list}
+        return {u: None for u in url_list}
+
+
+def _fetch_parallel(url_list: list[str], workers: int = None) -> dict[str, str | None]:
+    """
+    Split url_list across N parallel Playwright processes.
+    Each process launches its own Chromium — independent TLS fingerprints.
+    """
+    workers = workers or PARALLEL_WORKERS
+    if len(url_list) <= BATCH_SIZE or workers <= 1:
+        return _fetch_batch(url_list)
+
+    chunk_size = max(1, len(url_list) // workers)
+    chunks = [url_list[i:i+chunk_size] for i in range(0, len(url_list), chunk_size)]
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+        futures = {pool.submit(_fetch_batch, chunk): chunk for chunk in chunks}
+        for future in as_completed(futures):
+            try:
+                results.update(future.result())
+            except Exception as e:
+                log.warning("parallel worker error: %s", e)
+                for u in futures[future]:
+                    results[u] = None
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HTML parsing
+#  HTML parsing — brukare page (person)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_NOT_FOUND_PHRASES = [
-    "Kunde inte hitta brukaren",
-    "hittar inte den sida",
-    "Ooups",
-]
+_NOT_FOUND = ["Kunde inte hitta brukaren", "hittar inte den sida", "Ooups"]
 
 
 def _parse_brukare(html: str | None, pnr: str) -> dict | None:
     if not html:
         return None
-
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(separator=" ", strip=True)
 
-    for phrase in _NOT_FOUND_PHRASES:
+    for phrase in _NOT_FOUND:
         if phrase in text:
             return None
 
@@ -189,17 +232,13 @@ def _parse_brukare(html: str | None, pnr: str) -> dict | None:
         namn = name_m.group(1).strip()
     else:
         name_m2 = re.search(
-            r"([A-ZÅÄÖ][a-zåäöA-ZÅÄÖ][a-zåäöA-ZÅÄÖ\-\s]{1,50}),\s+en\s+privatperson",
-            text,
-        )
+            r"([A-ZÅÄÖ][a-zåäöA-ZÅÄÖ][a-zåäöA-ZÅÄÖ\-\s]{1,50}),\s+en\s+privatperson", text)
         namn = name_m2.group(1).strip() if name_m2 else ""
-
     if not namn:
         return None
 
     age_m  = re.search(r"(\d{1,3})\s+år", text)
     alder  = int(age_m.group(1)) if age_m else 0
-
     city_m = re.search(r"bor\s+i\s+([A-ZÅÄÖ][a-zåäö]+(?:[\s-][A-ZÅÄÖ][a-zåäö]+)?)", text)
     stad   = city_m.group(1).strip() if city_m else ""
 
@@ -210,9 +249,7 @@ def _parse_brukare(html: str | None, pnr: str) -> dict | None:
     else:
         gata = ""
 
-    fordon_egna_regnr  = []
-    fordon_egna_modell = []
-
+    fordon_egna_regnr, fordon_egna_modell = [], []
     owned_hdr = soup.find(string=re.compile(r"s\s+fordon", re.I))
     if owned_hdr:
         parent = owned_hdr.find_parent()
@@ -238,28 +275,144 @@ def _parse_brukare(html: str | None, pnr: str) -> dict | None:
                         fordon_adress_regnr.append(cols[1])
 
     return {
-        "pnr":                   pnr,
-        "namn":                  namn,
-        "alder":                 alder,
-        "stad":                  stad,
-        "gata":                  gata,
-        "har_fordon":            len(fordon_egna_regnr) > 0,
-        "antal_fordon_egna":     len(fordon_egna_regnr),
-        "fordon_egna_regnr":     "|".join(fordon_egna_regnr),
-        "fordon_egna_modell":    "|".join(fordon_egna_modell),
-        "antal_fordon_adress":   len(fordon_adress_regnr),
-        "fordon_adress_regnr":   "|".join(fordon_adress_regnr),
-        "hamtad":                datetime.now().isoformat(timespec="seconds"),
+        "pnr": pnr, "namn": namn, "alder": alder, "stad": stad, "gata": gata,
+        "har_fordon": len(fordon_egna_regnr) > 0,
+        "antal_fordon_egna": len(fordon_egna_regnr),
+        "fordon_egna_regnr": "|".join(fordon_egna_regnr),
+        "fordon_egna_modell": "|".join(fordon_egna_modell),
+        "antal_fordon_adress": len(fordon_adress_regnr),
+        "fordon_adress_regnr": "|".join(fordon_adress_regnr),
+        "hamtad": datetime.now().isoformat(timespec="seconds"),
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main scraper loop
+#  HTML parsing — prefix search page (vehicles)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run(start_year: int, end_year: int, target: int) -> None:
-    log.info("Scraper started: years=%d-%d target=%d", start_year, end_year, target)
+def _parse_prefix_page(html: str | None) -> tuple[list[dict], int]:
+    """Parse a /fordon/{PREFIX}/{PAGE}/ page. Returns (vehicles, total_hits)."""
+    if not html:
+        return [], 0
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(separator=" ", strip=True)
 
+    count_m = re.search(r"Visar\s+\d+\s+till\s+\d+\s+av\s+([\d\s]+)\s+träffar", text)
+    total = int(count_m.group(1).replace(" ", "")) if count_m else 0
+
+    table = soup.find("table")
+    if not table:
+        return [], total
+
+    vehicles = []
+    for row in table.find_all("tr")[1:]:
+        cols = [td.get_text(strip=True) for td in row.find_all("td")]
+        if len(cols) < 4:
+            continue
+        link = row.find("a", href=re.compile(r"/fordon/"))
+        href = link["href"] if link else ""
+        uuid_m = re.search(
+            r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/?$", href)
+        status = row.get("class", [""])[0] if row.get("class") else ""
+
+        vehicles.append({
+            "regnr":      cols[1].strip() if len(cols) > 1 else "",
+            "modell":     cols[0].strip(),
+            "farg":       cols[2].strip() if len(cols) > 2 else "",
+            "fordonstyp": cols[3].strip() if len(cols) > 3 else "",
+            "modellar":   cols[4].strip() if len(cols) > 4 else "",
+            "status":     status,
+            "vehicle_id": uuid_m.group(1) if uuid_m else None,
+            "url":        urljoin(BASE, href) if href else None,
+        })
+    return vehicles, total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Phase 1: Prefix enumeration (fast — all vehicles)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_phase1() -> None:
+    """
+    Enumerate all 3-letter prefixes AAA..ZZZ.
+    Each prefix: fetch pages until exhausted (100 vehicles/page).
+    Insert each vehicle owner as a person (har_fordon=1).
+    ~123,000 page loads → ~11.4M vehicles → estimated 1-2 days.
+    """
+    state = db.get_job_state()
+    resume_prefix = state.get("phase1_prefix", "")
+    prefixes_done = state.get("phase1_prefixes_done", 0)
+    vehicles_found = state.get("phase1_vehicles", 0)
+
+    log.info("Phase 1: prefix enumeration. Resume from '%s', %d prefixes done",
+             resume_prefix, prefixes_done)
+    db.update_job_state(status="running", phase="phase1")
+
+    for prefix in _iter_prefixes(resume_prefix):
+        if _stop_event.is_set():
+            db.update_job_state(status="paused", phase1_prefix=prefix)
+            log.info("Phase 1 paused at prefix %s", prefix)
+            return
+
+        page_num = 1
+        while True:
+            if _stop_event.is_set():
+                db.update_job_state(status="paused", phase1_prefix=prefix)
+                return
+
+            urls = []
+            for p in range(page_num, page_num + PARALLEL_WORKERS):
+                urls.append(_prefix_page_url(prefix, p))
+
+            html_map = _fetch_parallel(urls, workers=len(urls))
+
+            any_results = False
+            for p_idx, url in enumerate(urls):
+                html = html_map.get(url)
+                vehicles, total = _parse_prefix_page(html)
+                if not vehicles:
+                    continue
+                any_results = True
+                for v in vehicles:
+                    regnr = v.get("regnr", "")
+                    if regnr:
+                        db.insert_vehicle({
+                            "regnr": regnr,
+                            "modell": v.get("modell", ""),
+                            "farg": v.get("farg", ""),
+                            "fordonstyp": v.get("fordonstyp", ""),
+                            "modellar": v.get("modellar", ""),
+                            "status": v.get("status", ""),
+                            "vehicle_id": v.get("vehicle_id", ""),
+                            "hamtad": datetime.now().isoformat(timespec="seconds"),
+                        })
+                        vehicles_found += 1
+
+            if not any_results:
+                break
+            page_num += PARALLEL_WORKERS
+
+        prefixes_done += 1
+        db.update_job_state(
+            phase1_prefix=prefix,
+            phase1_prefixes_done=prefixes_done,
+            phase1_vehicles=vehicles_found,
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        if prefixes_done % 50 == 0:
+            log.info("Phase 1: %d/%d prefixes, %d vehicles",
+                     prefixes_done, TOTAL_PREFIXES, vehicles_found)
+
+    log.info("Phase 1 complete: %d prefixes, %d vehicles", prefixes_done, vehicles_found)
+    db.update_job_state(status="phase1_done", phase="phase1_done",
+                        phase1_prefixes_done=prefixes_done, phase1_vehicles=vehicles_found)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Phase 2: PNR enumeration with parallel workers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_phase2(start_year: int, end_year: int, target: int) -> None:
     state = db.get_job_state()
     resume = None
     tested    = state.get("total_tested",    0)
@@ -269,37 +422,34 @@ def _run(start_year: int, end_year: int, target: int) -> None:
 
     if state.get("current_year", 0) > 0:
         resume = (
-            state["current_year"],
-            state["current_month"],
-            state["current_day"],
-            state["current_individ"],
+            state["current_year"], state["current_month"],
+            state["current_day"],  state["current_individ"],
         )
-        log.info("Resuming from %d-%02d-%02d individ %d",
+        log.info("Phase 2: resuming from %d-%02d-%02d individ %d",
                  resume[0], resume[1], resume[2], resume[3])
 
     db.update_job_state(
-        status="running",
-        start_year=start_year,
-        end_year=end_year,
-        target_people=target,
+        status="running", phase="phase2",
+        start_year=start_year, end_year=end_year, target_people=target,
         started_at=state.get("started_at") or datetime.now().isoformat(timespec="seconds"),
     )
 
-    batch_pnrs: list[str]   = []
-    batch_pos:  list[tuple]  = []
+    big_batch_size = BATCH_SIZE * PARALLEL_WORKERS
+    batch_pnrs: list[str]  = []
+    batch_pos:  list[tuple] = []
 
-    def flush_batch() -> None:
+    def flush() -> None:
         nonlocal tested, found, not_found, errors
-
         if not batch_pnrs:
             return
 
-        html_map = _fetch_batch(batch_pnrs)
+        url_map = {_pnr_to_url(p): p for p in batch_pnrs}
+        html_map = _fetch_parallel(list(url_map.keys()))
 
-        last_year = last_month = last_day = last_individ = 0
-
+        ly = lm = ld = li = 0
         for (y, mo, d, ind), pnr in zip(batch_pos, batch_pnrs):
-            html = html_map.get(pnr)
+            url = _pnr_to_url(pnr)
+            html = html_map.get(url)
             tested += 1
             if html is None:
                 errors += 1
@@ -310,42 +460,55 @@ def _run(start_year: int, end_year: int, target: int) -> None:
                     found += 1
                 else:
                     not_found += 1
-            last_year, last_month, last_day, last_individ = y, mo, d, ind
+            ly, lm, ld, li = y, mo, d, ind
 
-        db.save_checkpoint(
-            last_year, last_month, last_day, last_individ,
-            tested, found, not_found, errors,
-        )
-        log.info("checkpoint year=%d tested=%d found=%d",
-                 last_year, tested, found)
-
+        db.save_checkpoint(ly, lm, ld, li, tested, found, not_found, errors)
+        log.info("Phase 2 checkpoint: year=%d tested=%d found=%d", ly, tested, found)
         batch_pnrs.clear()
         batch_pos.clear()
 
     try:
         for y, mo, d, ind, pnr in _iter_pnrs(start_year, end_year, resume):
             if _stop_event.is_set():
-                log.info("Stop signal received — pausing.")
-                flush_batch()
+                flush()
                 db.update_job_state(status="paused")
                 return
-
             if target > 0 and found >= target:
-                log.info("Target %d reached.", target)
-                flush_batch()
+                flush()
                 db.update_job_state(status="done")
                 return
 
             batch_pnrs.append(pnr)
             batch_pos.append((y, mo, d, ind))
 
-            if len(batch_pnrs) >= BATCH_SIZE:
-                flush_batch()
+            if len(batch_pnrs) >= big_batch_size:
+                flush()
 
-        flush_batch()
-
-        log.info("Enumeration complete. total_tested=%d total_found=%d", tested, found)
+        flush()
+        log.info("Phase 2 complete: tested=%d found=%d", tested, found)
         db.update_job_state(status="done")
+
+    except Exception as e:
+        log.exception("Phase 2 crashed: %s", e)
+        db.update_job_state(status="error")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main run loop (both phases)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run(start_year: int, end_year: int, target: int, skip_phase1: bool = False) -> None:
+    try:
+        state = db.get_job_state()
+        phase = state.get("phase", "")
+
+        if not skip_phase1 and phase not in ("phase1_done", "phase2"):
+            _run_phase1()
+            if _stop_event.is_set():
+                return
+
+        if not _stop_event.is_set():
+            _run_phase2(start_year, end_year, target)
 
     except Exception as e:
         log.exception("Scraper crashed: %s", e)
@@ -357,24 +520,21 @@ def _run(start_year: int, end_year: int, target: int) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Public control interface (called by main.py)
+#  Public control interface
 # ─────────────────────────────────────────────────────────────────────────────
 
-def start(target: int = 0, start_year: int | None = None, end_year: int | None = None) -> bool:
+def start(target: int = 0, start_year: int | None = None,
+          end_year: int | None = None, skip_phase1: bool = False) -> bool:
     global _thread
-
     with _state_lock:
         if _thread is not None and _thread.is_alive():
             return False
-
         _stop_event.clear()
         sy = start_year or START_YEAR
         ey = end_year   or END_YEAR
         _thread = threading.Thread(
-            target=_run,
-            args=(sy, ey, target),
-            daemon=True,
-            name="scraper",
+            target=_run, args=(sy, ey, target, skip_phase1),
+            daemon=True, name="scraper",
         )
         _thread.start()
     return True
@@ -390,6 +550,7 @@ def is_running() -> bool:
 
 def get_status() -> dict:
     state  = db.get_job_state()
+    phase  = state.get("phase", "idle")
     sy     = state.get("start_year",  START_YEAR)
     ey     = state.get("end_year",    END_YEAR)
     cy     = state.get("current_year",  sy)
@@ -402,40 +563,52 @@ def get_status() -> dict:
     errs   = state.get("total_errors",   0)
     target = state.get("target_people",  0)
 
-    total_space = _total_size(sy, ey)
-    current_pos = _position_index(max(cy, sy), cm, cd, ci, sy) if cy >= sy else 0
+    total_space = _total_pnr_space(sy, ey)
+    current_pos = _pnr_position_index(max(cy, sy), cm, cd, ci, sy) if cy >= sy else 0
     pct_done    = round(current_pos / total_space * 100, 2) if total_space else 0
-    remaining   = max(0, total_space - current_pos)
-    hit_rate    = round(found / tested * 100, 1) if tested else 0
-    started     = state.get("started_at", "")
+
+    # Phase 1 stats
+    p1_prefixes = state.get("phase1_prefixes_done", 0)
+    p1_vehicles = state.get("phase1_vehicles", 0)
+    p1_pct      = round(p1_prefixes / TOTAL_PREFIXES * 100, 1) if p1_prefixes else 0
 
     eta_seconds = None
+    started = state.get("started_at", "")
     if tested > 0 and started:
         try:
             elapsed = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
-            rate    = tested / elapsed if elapsed > 0 else 0
+            rate = tested / elapsed if elapsed > 0 else 0
+            remaining = max(0, total_space - current_pos)
             eta_seconds = int(remaining / rate) if rate > 0 else None
         except Exception:
             pass
 
     return {
-        "status":           state.get("status", "idle"),
-        "is_running":       is_running(),
-        "start_year":       sy,
-        "end_year":         ey,
-        "current_position": f"{cy}-{cm:02d}-{cd:02d} individ {ci}",
-        "pct_done":         pct_done,
-        "total_space":      total_space,
-        "total_tested":     tested,
-        "total_found":      found,
-        "total_not_found":  n_f,
-        "total_errors":     errs,
-        "hit_rate_pct":     hit_rate,
-        "target_people":    target,
-        "db_size_mb":       round(db.db_file_size_mb(), 1),
-        "eta_seconds":      eta_seconds,
-        "started_at":       started,
-        "updated_at":       state.get("updated_at", ""),
+        "status":               state.get("status", "idle"),
+        "phase":                phase,
+        "is_running":           is_running(),
+        "parallel_workers":     PARALLEL_WORKERS,
+        # Phase 1
+        "phase1_prefixes_done": p1_prefixes,
+        "phase1_prefixes_total": TOTAL_PREFIXES,
+        "phase1_pct":           p1_pct,
+        "phase1_vehicles":      p1_vehicles,
+        # Phase 2
+        "start_year":           sy,
+        "end_year":             ey,
+        "current_position":     f"{cy}-{cm:02d}-{cd:02d} individ {ci}",
+        "phase2_pct_done":      pct_done,
+        "total_pnr_space":      total_space,
+        "total_tested":         tested,
+        "total_found":          found,
+        "total_not_found":      n_f,
+        "total_errors":         errs,
+        "hit_rate_pct":         round(found / tested * 100, 1) if tested else 0,
+        "target_people":        target,
+        "db_size_mb":           round(db.db_file_size_mb(), 1),
+        "eta_seconds":          eta_seconds,
+        "started_at":           started,
+        "updated_at":           state.get("updated_at", ""),
     }
 
 
@@ -443,8 +616,10 @@ def maybe_auto_resume() -> None:
     if os.environ.get("AUTO_RESUME", "true").lower() not in ("true", "1", "yes"):
         return
     state = db.get_job_state()
-    if state.get("status") == "running" and state.get("total_tested", 0) > 0:
-        log.info("AUTO_RESUME: resuming interrupted job from checkpoint.")
+    if state.get("status") == "running" and (
+        state.get("total_tested", 0) > 0 or state.get("phase1_prefixes_done", 0) > 0
+    ):
+        log.info("AUTO_RESUME: resuming from checkpoint.")
         target = state.get("target_people", 0)
         sy     = state.get("start_year", START_YEAR)
         ey     = state.get("end_year",   END_YEAR)

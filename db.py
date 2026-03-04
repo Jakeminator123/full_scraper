@@ -2,11 +2,9 @@
 db.py — SQLite helper for the full population scraper.
 
 Tables:
-  people     — one row per found person
+  people     — one row per found person (from brukare pages)
+  vehicles   — one row per vehicle (from prefix enumeration, Phase 1)
   job_state  — single row tracking the scraper's position and counters
-
-Uses WAL journal mode so the FastAPI read threads and the scraper write thread
-can operate concurrently without blocking each other.
 """
 
 import sqlite3
@@ -21,7 +19,6 @@ _local = threading.local()
 
 
 def _conn() -> sqlite3.Connection:
-    """Return a thread-local SQLite connection with WAL mode enabled."""
     if not hasattr(_local, "conn") or _local.conn is None:
         os.makedirs(DATA_DIR, exist_ok=True)
         c = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -34,7 +31,6 @@ def _conn() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create tables if they don't exist. Called once at startup."""
     conn = _conn()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS people (
@@ -52,22 +48,39 @@ def init_db() -> None:
             hamtad              TEXT    DEFAULT ''
         );
 
+        CREATE TABLE IF NOT EXISTS vehicles (
+            regnr       TEXT PRIMARY KEY,
+            modell      TEXT    DEFAULT '',
+            farg        TEXT    DEFAULT '',
+            fordonstyp  TEXT    DEFAULT '',
+            modellar    TEXT    DEFAULT '',
+            status      TEXT    DEFAULT '',
+            vehicle_id  TEXT    DEFAULT '',
+            hamtad      TEXT    DEFAULT ''
+        );
+
         CREATE TABLE IF NOT EXISTS job_state (
-            id                INTEGER PRIMARY KEY DEFAULT 1,
-            status            TEXT    DEFAULT 'idle',
-            current_year      INTEGER DEFAULT 0,
-            current_month     INTEGER DEFAULT 0,
-            current_day       INTEGER DEFAULT 0,
-            current_individ   INTEGER DEFAULT 0,
-            total_tested      INTEGER DEFAULT 0,
-            total_found       INTEGER DEFAULT 0,
-            total_not_found   INTEGER DEFAULT 0,
-            total_errors      INTEGER DEFAULT 0,
-            target_people     INTEGER DEFAULT 0,
-            start_year        INTEGER DEFAULT 1940,
-            end_year          INTEGER DEFAULT 2005,
-            started_at        TEXT    DEFAULT '',
-            updated_at        TEXT    DEFAULT ''
+            id                     INTEGER PRIMARY KEY DEFAULT 1,
+            status                 TEXT    DEFAULT 'idle',
+            phase                  TEXT    DEFAULT '',
+            -- Phase 1: prefix enumeration
+            phase1_prefix          TEXT    DEFAULT '',
+            phase1_prefixes_done   INTEGER DEFAULT 0,
+            phase1_vehicles        INTEGER DEFAULT 0,
+            -- Phase 2: PNR enumeration
+            current_year           INTEGER DEFAULT 0,
+            current_month          INTEGER DEFAULT 0,
+            current_day            INTEGER DEFAULT 0,
+            current_individ        INTEGER DEFAULT 0,
+            total_tested           INTEGER DEFAULT 0,
+            total_found            INTEGER DEFAULT 0,
+            total_not_found        INTEGER DEFAULT 0,
+            total_errors           INTEGER DEFAULT 0,
+            target_people          INTEGER DEFAULT 0,
+            start_year             INTEGER DEFAULT 1940,
+            end_year               INTEGER DEFAULT 2005,
+            started_at             TEXT    DEFAULT '',
+            updated_at             TEXT    DEFAULT ''
         );
 
         INSERT OR IGNORE INTO job_state (id) VALUES (1);
@@ -95,7 +108,6 @@ def save_checkpoint(
     year: int, month: int, day: int, individ: int,
     tested: int, found: int, not_found: int, errors: int,
 ) -> None:
-    """Atomic checkpoint write — called after each batch."""
     _conn().execute(
         """UPDATE job_state SET
                current_year=?, current_month=?, current_day=?, current_individ=?,
@@ -144,29 +156,21 @@ def count_people(har_fordon: int | None = None) -> int:
 
 
 def get_people(
-    page: int = 1,
-    limit: int = 100,
+    page: int = 1, limit: int = 100,
     har_fordon: int | None = None,
-    stad: str | None = None,
-    search: str | None = None,
+    stad: str | None = None, search: str | None = None,
 ) -> list[dict]:
     limit  = min(limit, 1000)
     offset = (page - 1) * limit
-
     wheres, params = [], []
     if har_fordon is not None:
-        wheres.append("har_fordon=?")
-        params.append(har_fordon)
+        wheres.append("har_fordon=?"); params.append(har_fordon)
     if stad:
-        wheres.append("stad LIKE ?")
-        params.append(f"%{stad}%")
+        wheres.append("stad LIKE ?"); params.append(f"%{stad}%")
     if search:
-        wheres.append("namn LIKE ?")
-        params.append(f"%{search}%")
-
+        wheres.append("namn LIKE ?"); params.append(f"%{search}%")
     where_sql = f"WHERE {' AND '.join(wheres)}" if wheres else ""
     params += [limit, offset]
-
     rows = _conn().execute(
         f"SELECT * FROM people {where_sql} ORDER BY hamtad DESC LIMIT ? OFFSET ?",
         params,
@@ -175,14 +179,54 @@ def get_people(
 
 
 def iter_all_people() -> Generator[dict, None, None]:
-    """Generator for streaming export — yields one dict per row."""
-    conn = _conn()
-    for row in conn.execute("SELECT * FROM people ORDER BY rowid"):
+    for row in _conn().execute("SELECT * FROM people ORDER BY rowid"):
         yield dict(row)
 
 
+# ── vehicles ───────────────────────────────────────────────────────────────────
+
+def insert_vehicle(v: dict) -> bool:
+    try:
+        _conn().execute(
+            """INSERT OR IGNORE INTO vehicles
+               (regnr, modell, farg, fordonstyp, modellar, status, vehicle_id, hamtad)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (
+                v["regnr"], v.get("modell",""), v.get("farg",""),
+                v.get("fordonstyp",""), v.get("modellar",""),
+                v.get("status",""), v.get("vehicle_id",""),
+                v.get("hamtad",""),
+            ),
+        )
+        _conn().commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def count_vehicles() -> int:
+    row = _conn().execute("SELECT COUNT(*) FROM vehicles").fetchone()
+    return row[0] if row else 0
+
+
+def get_vehicles(page: int = 1, limit: int = 100) -> list[dict]:
+    limit  = min(limit, 1000)
+    offset = (page - 1) * limit
+    rows = _conn().execute(
+        "SELECT * FROM vehicles ORDER BY rowid DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def iter_all_vehicles() -> Generator[dict, None, None]:
+    for row in _conn().execute("SELECT * FROM vehicles ORDER BY rowid"):
+        yield dict(row)
+
+
+# ── utils ──────────────────────────────────────────────────────────────────────
+
 def wal_checkpoint() -> None:
-    """Flush WAL to main database file. Call before streaming .db file export."""
     _conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
 

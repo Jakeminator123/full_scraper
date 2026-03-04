@@ -92,6 +92,7 @@ def status(_: Auth) -> dict:
     s["total_people_in_db"]      = db.count_people()
     s["people_with_vehicles"]    = db.count_people(har_fordon=1)
     s["people_without_vehicles"] = db.count_people(har_fordon=0)
+    s["total_vehicles_in_db"]    = db.count_vehicles()
     return s
 
 
@@ -194,18 +195,20 @@ def export_sqlite(_: Auth) -> StreamingResponse:
 @app.post("/job/start", tags=["job"])
 def job_start(
     _: Auth,
-    target:     int = Query(0,    ge=0,             description="Stop after N people found (0 = unlimited)"),
-    start_year: int = Query(None, ge=1900, le=2010, description="Override START_YEAR"),
-    end_year:   int = Query(None, ge=1900, le=2010, description="Override END_YEAR"),
+    target:      int  = Query(0,     ge=0,             description="Stop after N people found (0 = unlimited)"),
+    start_year:  int  = Query(None,  ge=1900, le=2010, description="Override START_YEAR"),
+    end_year:    int  = Query(None,  ge=1900, le=2010, description="Override END_YEAR"),
+    skip_phase1: bool = Query(False,                   description="Skip vehicle prefix enumeration (Phase 1)"),
 ) -> dict:
     if scraper.is_running():
         raise HTTPException(status_code=409, detail="Scraper is already running.")
 
-    ok = scraper.start(target=target, start_year=start_year, end_year=end_year)
+    ok = scraper.start(target=target, start_year=start_year,
+                       end_year=end_year, skip_phase1=skip_phase1)
     if not ok:
         raise HTTPException(status_code=409, detail="Could not start scraper.")
 
-    return {"started": True, "target": target}
+    return {"started": True, "target": target, "skip_phase1": skip_phase1}
 
 
 @app.post("/job/stop", tags=["job"])
