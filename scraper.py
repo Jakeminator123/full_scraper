@@ -502,13 +502,23 @@ def _run(start_year: int, end_year: int, target: int, skip_phase1: bool = False)
         state = db.get_job_state()
         phase = state.get("phase", "")
 
-        if not skip_phase1 and phase not in ("phase1_done", "phase2"):
-            _run_phase1()
-            if _stop_event.is_set():
-                return
+        phase1_needed = (not skip_phase1 and phase not in ("phase1_done",))
 
+        if phase1_needed:
+            # Run both phases in parallel — 5 workers each (fits in 2 GB RAM)
+            phase1_thread = threading.Thread(
+                target=_run_phase1, daemon=True, name="phase1")
+            phase1_thread.start()
+            log.info("Phase 1 started in parallel thread")
+
+        # Phase 2 runs in this thread (the main scraper thread)
         if not _stop_event.is_set():
             _run_phase2(start_year, end_year, target)
+
+        # Wait for phase 1 to finish if it's still running
+        if phase1_needed and phase1_thread.is_alive():
+            log.info("Waiting for phase 1 to finish...")
+            phase1_thread.join()
 
     except Exception as e:
         log.exception("Scraper crashed: %s", e)
