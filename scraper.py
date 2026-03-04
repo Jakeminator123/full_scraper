@@ -37,11 +37,11 @@ log = logging.getLogger("scraper")
 BASE             = "https://biluppgifter.se"
 APP_DIR          = os.path.dirname(os.path.abspath(__file__))
 FETCH_JS         = os.path.join(APP_DIR, "fetch_helper.js")
-PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.3"))
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "15"))
+PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.2"))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "50"))
 PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "5"))
-START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
-END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
+START_YEAR       = int(os.environ.get("START_YEAR",         "1965"))
+END_YEAR         = int(os.environ.get("END_YEAR",           "2000"))
 
 _thread:     threading.Thread | None = None
 _stop_event: threading.Event          = threading.Event()
