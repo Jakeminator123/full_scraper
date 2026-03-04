@@ -85,6 +85,17 @@ def init_db() -> None:
 
         INSERT OR IGNORE INTO job_state (id) VALUES (1);
     """)
+    # Migrate: add columns that may be missing from v1 schema
+    for col, default in [
+        ("phase",                  "''"),
+        ("phase1_prefix",          "''"),
+        ("phase1_prefixes_done",   "0"),
+        ("phase1_vehicles",        "0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE job_state ADD COLUMN {col} TEXT DEFAULT {default}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
 
 
