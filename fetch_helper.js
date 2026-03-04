@@ -19,7 +19,7 @@ const args        = process.argv.slice(2);
 const MODE_STDIN  = args[0] === "--stdin";
 const MODE_SINGLE = !MODE_STDIN;
 
-const pauseMs = Math.round(parseFloat(process.env.PAGE_PAUSE || "0.2") * 1000);
+const pauseMs = Math.round(parseFloat(process.env.PAGE_PAUSE || "0.3") * 1000);
 
 const CTX_OPTS = {
   userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",

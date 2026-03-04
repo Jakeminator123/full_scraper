@@ -193,6 +193,18 @@ def get_people(
     return [dict(r) for r in rows]
 
 
+def existing_pnrs(pnr_list: list[str]) -> set[str]:
+    """Return the subset of pnr_list that already exist in the people table."""
+    if not pnr_list:
+        return set()
+    conn = _conn()
+    placeholders = ",".join("?" * len(pnr_list))
+    rows = conn.execute(
+        f"SELECT pnr FROM people WHERE pnr IN ({placeholders})", pnr_list
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
 def iter_all_people() -> Generator[dict, None, None]:
     for row in _conn().execute("SELECT * FROM people ORDER BY rowid"):
         yield dict(row)

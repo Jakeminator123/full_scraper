@@ -37,11 +37,11 @@ log = logging.getLogger("scraper")
 BASE             = "https://biluppgifter.se"
 APP_DIR          = os.path.dirname(os.path.abspath(__file__))
 FETCH_JS         = os.path.join(APP_DIR, "fetch_helper.js")
-PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.2"))
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "50"))
+PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.3"))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "30"))
 PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "5"))
-START_YEAR       = int(os.environ.get("START_YEAR",         "1965"))
-END_YEAR         = int(os.environ.get("END_YEAR",           "2000"))
+START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
+END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
 
 _thread:     threading.Thread | None = None
 _stop_event: threading.Event          = threading.Event()
@@ -88,13 +88,13 @@ def _pnr_to_url(pnr: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _total_pnr_space(start_year: int, end_year: int) -> int:
-    return (end_year - start_year + 1) * 12 * 28 * 999
+    return (end_year - start_year + 1) * 12 * 31 * 999
 
 
 def _pnr_position_index(year: int, month: int, day: int, individ: int, start_year: int) -> int:
     return (
-        (year - start_year) * 12 * 28 * 999
-        + (month - 1) * 28 * 999
+        (year - start_year) * 12 * 31 * 999
+        + (month - 1) * 31 * 999
         + (day - 1) * 999
         + (individ - 1)
     )
@@ -110,7 +110,7 @@ def _iter_pnrs(
         ri += 1
         if ri > 999:
             ri = 1; rd += 1
-        if rd > 28:
+        if rd > 31:
             rd = 1; rm += 1
         if rm > 12:
             rm = 1; ry += 1
@@ -121,7 +121,7 @@ def _iter_pnrs(
         m_start = rm if year == ry else 1
         for month in range(m_start, 13):
             d_start = rd if (year == ry and month == rm) else 1
-            for day in range(d_start, 29):
+            for day in range(d_start, 32):
                 i_start = ri if (year == ry and month == rm and day == rd) else 1
                 for individ in range(i_start, 1000):
                     pnr = make_pnr(year, month, day, individ)
@@ -443,25 +443,39 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
         if not batch_pnrs:
             return
 
-        url_map = {_pnr_to_url(p): p for p in batch_pnrs}
-        html_map = _fetch_parallel(list(url_map.keys()))
-
-        ly = lm = ld = li = 0
+        known = db.existing_pnrs(list(batch_pnrs))
+        to_fetch_pnrs = []
+        to_fetch_pos = []
         for (y, mo, d, ind), pnr in zip(batch_pos, batch_pnrs):
-            url = _pnr_to_url(pnr)
-            html = html_map.get(url)
-            tested += 1
-            if html is None:
-                errors += 1
+            if pnr in known:
+                tested += 1
+                found += 1
             else:
-                person = _parse_brukare(html, pnr)
-                if person:
-                    db.insert_person(person)
-                    found += 1
-                else:
-                    not_found += 1
-            ly, lm, ld, li = y, mo, d, ind
+                to_fetch_pnrs.append(pnr)
+                to_fetch_pos.append((y, mo, d, ind))
 
+        if known:
+            log.debug("Skipped %d already-known PNRs", len(known))
+
+        if to_fetch_pnrs:
+            url_map = {_pnr_to_url(p): p for p in to_fetch_pnrs}
+            html_map = _fetch_parallel(list(url_map.keys()))
+
+            for (y, mo, d, ind), pnr in zip(to_fetch_pos, to_fetch_pnrs):
+                url = _pnr_to_url(pnr)
+                html = html_map.get(url)
+                tested += 1
+                if html is None:
+                    errors += 1
+                else:
+                    person = _parse_brukare(html, pnr)
+                    if person:
+                        db.insert_person(person)
+                        found += 1
+                    else:
+                        not_found += 1
+
+        ly, lm, ld, li = batch_pos[-1]
         db.save_checkpoint(ly, lm, ld, li, tested, found, not_found, errors)
         log.info("Phase 2 checkpoint: year=%d tested=%d found=%d", ly, tested, found)
         batch_pnrs.clear()
