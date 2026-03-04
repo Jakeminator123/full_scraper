@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import os
+import signal
 from contextlib import asynccontextmanager
 from typing import Annotated
 
@@ -40,12 +41,23 @@ log = logging.getLogger("main")
 API_KEY = os.environ.get("API_KEY", "")
 
 
+def _handle_sigterm(signum, frame):
+    """Docker sends SIGTERM on stop/redeploy. Gracefully stop the scraper so
+    the current batch finishes and checkpoint is saved before the process dies."""
+    log.info("SIGTERM received — stopping scraper gracefully")
+    scraper.stop()
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
 @asynccontextmanager
 async def lifespan(application):
     db.init_db()
     log.info("Database initialised at %s", db.DB_PATH)
     scraper.maybe_auto_resume()
     yield
+    log.info("Shutting down — stopping scraper")
+    scraper.stop()
 
 app = FastAPI(
     title="Full Population Scraper API",

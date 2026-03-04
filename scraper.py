@@ -439,6 +439,7 @@ def _run_phase0(start_year: int, end_year: int) -> None:
                 urls     = [_pnr_to_url(h["pnr"]) for h in to_fetch]
                 html_map = _fetch_batch(urls)
 
+                new_people = []
                 for h in to_fetch:
                     url  = _pnr_to_url(h["pnr"])
                     html = html_map.get(url)
@@ -446,9 +447,11 @@ def _run_phase0(start_year: int, end_year: int) -> None:
                         continue
                     person = _parse_brukare(html, h["pnr"])
                     if person:
-                        db.insert_person(person)
-                        found += 1
-                        date_new += 1
+                        new_people.append(person)
+
+                batch_inserted = db.insert_people_batch(new_people)
+                found += batch_inserted
+                date_new += batch_inserted
 
         dates_processed += 1
         db.update_job_state(
@@ -502,16 +505,18 @@ def _run_phase1() -> None:
             html_map = _fetch_parallel(urls, workers=len(urls))
 
             any_results = False
+            batch_vehicles = []
             for p_idx, url in enumerate(urls):
                 html = html_map.get(url)
                 vehicles, total = _parse_prefix_page(html)
                 if not vehicles:
                     continue
                 any_results = True
+                ts = datetime.now().isoformat(timespec="seconds")
                 for v in vehicles:
                     regnr = v.get("regnr", "")
                     if regnr:
-                        db.insert_vehicle({
+                        batch_vehicles.append({
                             "regnr": regnr,
                             "modell": v.get("modell", ""),
                             "farg": v.get("farg", ""),
@@ -519,9 +524,9 @@ def _run_phase1() -> None:
                             "modellar": v.get("modellar", ""),
                             "status": v.get("status", ""),
                             "vehicle_id": v.get("vehicle_id", ""),
-                            "hamtad": datetime.now().isoformat(timespec="seconds"),
+                            "hamtad": ts,
                         })
-                        vehicles_found += 1
+            vehicles_found += db.insert_vehicles_batch(batch_vehicles)
 
             if not any_results:
                 break
@@ -596,6 +601,7 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
             url_map = {_pnr_to_url(p): p for p in to_fetch_pnrs}
             html_map = _fetch_parallel(list(url_map.keys()))
 
+            new_people = []
             for (y, mo, d, ind), pnr in zip(to_fetch_pos, to_fetch_pnrs):
                 url = _pnr_to_url(pnr)
                 html = html_map.get(url)
@@ -605,10 +611,11 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
                 else:
                     person = _parse_brukare(html, pnr)
                     if person:
-                        db.insert_person(person)
-                        found += 1
+                        new_people.append(person)
                     else:
                         not_found += 1
+
+            found += db.insert_people_batch(new_people)
 
         ly, lm, ld, li = batch_pos[-1]
         db.save_checkpoint(ly, lm, ld, li, tested, found, not_found, errors)

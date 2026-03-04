@@ -163,6 +163,69 @@ def insert_person(p: dict) -> bool:
         return False
 
 
+def insert_people_batch(people: list[dict]) -> int:
+    """Insert multiple people in a single transaction. Returns count of new inserts."""
+    if not people:
+        return 0
+    conn = _conn()
+    inserted = 0
+    try:
+        conn.execute("BEGIN")
+        for p in people:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO people
+                   (pnr, namn, alder, stad, gata,
+                    har_fordon, antal_fordon_egna, fordon_egna_regnr, fordon_egna_modell,
+                    antal_fordon_adress, fordon_adress_regnr, hamtad)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    p["pnr"], p.get("namn",""), p.get("alder",0),
+                    p.get("stad",""), p.get("gata",""),
+                    1 if p.get("har_fordon") else 0,
+                    p.get("antal_fordon_egna",0), p.get("fordon_egna_regnr",""),
+                    p.get("fordon_egna_modell",""),
+                    p.get("antal_fordon_adress",0), p.get("fordon_adress_regnr",""),
+                    p.get("hamtad",""),
+                ),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return inserted
+
+
+def insert_vehicles_batch(vehicles: list[dict]) -> int:
+    """Insert multiple vehicles in a single transaction."""
+    if not vehicles:
+        return 0
+    conn = _conn()
+    inserted = 0
+    try:
+        conn.execute("BEGIN")
+        for v in vehicles:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO vehicles
+                   (regnr, modell, farg, fordonstyp, modellar, status, vehicle_id, hamtad)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    v["regnr"], v.get("modell",""), v.get("farg",""),
+                    v.get("fordonstyp",""), v.get("modellar",""),
+                    v.get("status",""), v.get("vehicle_id",""),
+                    v.get("hamtad",""),
+                ),
+            )
+            if cur.rowcount > 0:
+                inserted += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return inserted
+
+
 def count_people(har_fordon: int | None = None) -> int:
     if har_fordon is None:
         row = _conn().execute("SELECT COUNT(*) FROM people").fetchone()
