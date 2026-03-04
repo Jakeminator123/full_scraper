@@ -98,6 +98,9 @@ def init_db() -> None:
         except sqlite3.OperationalError:
             pass  # column already exists
     conn.commit()
+    # Force reconnect so the Row factory sees new columns
+    conn.close()
+    _local.conn = None
 
 
 # ── job_state ──────────────────────────────────────────────────────────────────
@@ -237,6 +240,18 @@ def iter_all_vehicles() -> Generator[dict, None, None]:
 
 
 # ── utils ──────────────────────────────────────────────────────────────────────
+
+def reset_db() -> None:
+    """Drop and recreate all tables. Called by /job/reset."""
+    conn = _conn()
+    conn.executescript("""
+        DROP TABLE IF EXISTS people;
+        DROP TABLE IF EXISTS vehicles;
+        DROP TABLE IF EXISTS job_state;
+    """)
+    conn.commit()
+    init_db()
+
 
 def wal_checkpoint() -> None:
     _conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")

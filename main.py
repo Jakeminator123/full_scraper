@@ -211,6 +211,15 @@ def job_start(
     return {"started": True, "target": target, "skip_phase1": skip_phase1}
 
 
+@app.post("/job/reset", tags=["job"])
+def job_reset(_: Auth) -> dict:
+    """Drop and recreate all tables. Loses all data."""
+    if scraper.is_running():
+        raise HTTPException(status_code=409, detail="Stop the scraper first.")
+    db.reset_db()
+    return {"reset": True, "detail": "All tables dropped and recreated."}
+
+
 @app.post("/job/stop", tags=["job"])
 def job_stop(_: Auth) -> dict:
     if not scraper.is_running():
