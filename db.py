@@ -85,12 +85,15 @@ def init_db() -> None:
 
         INSERT OR IGNORE INTO job_state (id) VALUES (1);
     """)
-    # Migrate: add columns that may be missing from v1 schema
+    # Migrate: add columns that may be missing from older schema versions
     migrations = [
         "ALTER TABLE job_state ADD COLUMN phase TEXT DEFAULT ''",
         "ALTER TABLE job_state ADD COLUMN phase1_prefix TEXT DEFAULT ''",
         "ALTER TABLE job_state ADD COLUMN phase1_prefixes_done INTEGER DEFAULT 0",
         "ALTER TABLE job_state ADD COLUMN phase1_vehicles INTEGER DEFAULT 0",
+        # Phase 0 columns (added in v3)
+        "ALTER TABLE job_state ADD COLUMN phase0_date TEXT DEFAULT ''",
+        "ALTER TABLE job_state ADD COLUMN phase0_found INTEGER DEFAULT 0",
     ]
     for sql in migrations:
         try:

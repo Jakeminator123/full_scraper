@@ -1,19 +1,26 @@
 """
-scraper.py — Two-phase population scraper for biluppgifter.se
+scraper.py — Three-phase population scraper for biluppgifter.se
+
+Phase 0 (SMART — ~3-5 days, 100% hit rate):
+  Search Ratsit by birth date (YYYYMMDD) + gender filter.
+  Each search returns up to 30 people (3 pages × 10).
+  Intercept /person/biluppgifter/ on each profile → extract PNR via base64.
+  Then fetch biluppgifter.se/brukare/{b64}/ for full person data.
+  → ~1.4M people from 24,000 dates × 2 genders × 30 hits/search.
 
 Phase 1 (FAST — ~1-2 days):
   Enumerate all 17,576 three-letter vehicle prefixes (AAA-ZZZ).
   Each prefix page returns 100 vehicles. Paginate until exhausted.
   For each vehicle: extract regnr, model, year, status, vehicleId.
-  For vehicles with vehicleId: the owner's brukare link exists.
-  → Covers ~11.4M vehicles and their owners.
+  → Covers ~11.4M vehicles.
 
 Phase 2 (SLOWER — parallel PNR enumeration):
   Generate valid PNRs via Luhn algorithm, fetch /brukare/base64(PNR)/.
   Runs N parallel Playwright workers for speed.
-  → Fills in people WITHOUT vehicles (~60% of population).
+  Phase 0 PNRs are already in DB → existing_pnrs() skips them automatically.
+  → Fills in remaining ~8-9M people not covered by Phase 0.
 
-Both phases checkpoint to SQLite for resume after restart.
+All phases checkpoint to SQLite for resume after restart.
 """
 
 import os
@@ -24,7 +31,7 @@ import subprocess
 import threading
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Generator
 from urllib.parse import urljoin
 
@@ -37,7 +44,9 @@ log = logging.getLogger("scraper")
 BASE             = "https://biluppgifter.se"
 APP_DIR          = os.path.dirname(os.path.abspath(__file__))
 FETCH_JS         = os.path.join(APP_DIR, "fetch_helper.js")
+RATSIT_JS        = os.path.join(APP_DIR, "ratsit_helper.js")
 PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.3"))
+PHASE0_PAUSE     = float(os.environ.get("PHASE0_PAUSE",     "1.0"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "30"))
 PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "5"))
 START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
@@ -329,6 +338,125 @@ def _parse_prefix_page(html: str | None) -> tuple[list[dict], int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Phase 0: Ratsit date-harvesting (smart — high hit rate, ~1.4M people)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _iter_dates(start_year: int, end_year: int, resume_date: str = "") -> Generator[date, None, None]:
+    """Yield all dates from start_year-01-01 to end_year-12-31, optionally resuming."""
+    start = date(start_year, 1, 1)
+    end   = date(end_year, 12, 31)
+
+    if resume_date:
+        try:
+            resumed = date.fromisoformat(resume_date)
+            start = resumed + timedelta(days=1)
+        except ValueError:
+            pass
+
+    current = start
+    while current <= end:
+        yield current
+        current += timedelta(days=1)
+
+
+def _ratsit_harvest(date_str: str, gender: str) -> list[dict]:
+    """
+    Call ratsit_helper.js for one date+gender combination.
+    Returns list of {pnr, name, age, city, gender}.
+    """
+    payload = json.dumps({"date": date_str, "gender": gender})
+    try:
+        r = subprocess.run(
+            ["node", RATSIT_JS, "--stdin"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=int(PHASE0_PAUSE * 60 + 120),
+            cwd=APP_DIR,
+            env={**os.environ, "PHASE0_PAUSE": str(PHASE0_PAUSE)},
+        )
+        if r.returncode != 0:
+            log.warning("ratsit_helper error [%s %s]: %s", date_str, gender, r.stderr.strip()[:200])
+            return []
+        hits = json.loads(r.stdout)
+        return hits if isinstance(hits, list) else []
+    except subprocess.TimeoutExpired:
+        log.warning("ratsit_helper timeout [%s %s]", date_str, gender)
+        return []
+    except Exception as e:
+        log.error("ratsit_helper exception [%s %s]: %s", date_str, gender, e)
+        return []
+
+
+def _run_phase0(start_year: int, end_year: int) -> None:
+    """
+    Phase 0: Harvest PNRs from Ratsit by searching each birth date + gender.
+    For each resolved PNR, fetch biluppgifter.se/brukare/{b64}/ and store person.
+    ~1.4M people expected from 24,000 dates × 2 genders × 30 max hits/search.
+    """
+    state       = db.get_job_state()
+    resume_date = state.get("phase0_date", "")
+    found       = state.get("phase0_found", 0)
+
+    log.info("Phase 0: Ratsit date-harvesting. Resume from '%s', found so far: %d",
+             resume_date or "start", found)
+    db.update_job_state(status="running", phase="phase0")
+
+    dates_processed = 0
+    for d in _iter_dates(start_year, end_year, resume_date):
+        if _stop_event.is_set():
+            db.update_job_state(status="paused", phase="phase0",
+                                phase0_date=d.isoformat())
+            log.info("Phase 0 paused at %s", d.isoformat())
+            return
+
+        date_str = d.isoformat()
+
+        for gender in ("m", "f"):
+            if _stop_event.is_set():
+                db.update_job_state(status="paused", phase="phase0",
+                                    phase0_date=date_str)
+                return
+
+            hits = _ratsit_harvest(date_str, gender)
+            if not hits:
+                continue
+
+            # Check which PNRs we already have before fetching biluppgifter
+            pnr_list = [h["pnr"] for h in hits if h.get("pnr")]
+            known    = db.existing_pnrs(pnr_list)
+            to_fetch = [h for h in hits if h.get("pnr") and h["pnr"] not in known]
+
+            # Fetch biluppgifter for new PNRs
+            if to_fetch:
+                urls     = [_pnr_to_url(h["pnr"]) for h in to_fetch]
+                html_map = _fetch_batch(urls)
+
+                for h in to_fetch:
+                    url  = _pnr_to_url(h["pnr"])
+                    html = html_map.get(url)
+                    if not html:
+                        continue
+                    person = _parse_brukare(html, h["pnr"])
+                    if person:
+                        db.insert_person(person)
+                        found += 1
+
+        dates_processed += 1
+        db.update_job_state(
+            phase0_date=date_str,
+            phase0_found=found,
+            updated_at=datetime.now().isoformat(timespec="seconds"),
+        )
+
+        if dates_processed % 100 == 0:
+            log.info("Phase 0: %d dates processed, %d people found", dates_processed, found)
+
+    log.info("Phase 0 complete: %d dates, %d people found", dates_processed, found)
+    db.update_job_state(phase="phase0_done", phase0_found=found)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Phase 1: Prefix enumeration (fast — all vehicles)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -511,28 +639,45 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
 #  Main run loop (both phases)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run(start_year: int, end_year: int, target: int, skip_phase1: bool = False) -> None:
+def _run(start_year: int, end_year: int, target: int,
+         skip_phase1: bool = False, skip_phase0: bool = False) -> None:
     try:
         state = db.get_job_state()
         phase = state.get("phase", "")
 
-        phase1_needed = (not skip_phase1 and phase not in ("phase1_done",))
+        bg_threads: list[threading.Thread] = []
 
-        if phase1_needed:
-            # Run both phases in parallel — 5 workers each (fits in 2 GB RAM)
+        # Phase 0: Ratsit harvesting in background (parallel, conservative rate)
+        phase0_needed = (
+            not skip_phase0
+            and phase not in ("phase0_done",)
+        )
+        if phase0_needed and not _stop_event.is_set():
+            phase0_thread = threading.Thread(
+                target=_run_phase0, args=(start_year, end_year),
+                daemon=True, name="phase0")
+            phase0_thread.start()
+            bg_threads.append(phase0_thread)
+            log.info("Phase 0 (Ratsit harvesting) started in background thread")
+
+        # Phase 1: vehicle prefix enumeration in background
+        phase1_needed = (not skip_phase1 and phase not in ("phase1_done",))
+        if phase1_needed and not _stop_event.is_set():
             phase1_thread = threading.Thread(
                 target=_run_phase1, daemon=True, name="phase1")
             phase1_thread.start()
-            log.info("Phase 1 started in parallel thread")
+            bg_threads.append(phase1_thread)
+            log.info("Phase 1 started in background thread")
 
-        # Phase 2 runs in this thread (the main scraper thread)
+        # Phase 2 runs in main thread — skips PNRs found by Phase 0
         if not _stop_event.is_set():
             _run_phase2(start_year, end_year, target)
 
-        # Wait for phase 1 to finish if it's still running
-        if phase1_needed and phase1_thread.is_alive():
-            log.info("Waiting for phase 1 to finish...")
-            phase1_thread.join()
+        # Wait for background threads
+        for t in bg_threads:
+            if t.is_alive():
+                log.info("Waiting for %s to finish...", t.name)
+                t.join()
 
     except Exception as e:
         log.exception("Scraper crashed: %s", e)
@@ -548,7 +693,8 @@ def _run(start_year: int, end_year: int, target: int, skip_phase1: bool = False)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def start(target: int = 0, start_year: int | None = None,
-          end_year: int | None = None, skip_phase1: bool = False) -> bool:
+          end_year: int | None = None, skip_phase1: bool = False,
+          skip_phase0: bool = False) -> bool:
     global _thread
     with _state_lock:
         if _thread is not None and _thread.is_alive():
@@ -557,7 +703,7 @@ def start(target: int = 0, start_year: int | None = None,
         sy = start_year or START_YEAR
         ey = end_year   or END_YEAR
         _thread = threading.Thread(
-            target=_run, args=(sy, ey, target, skip_phase1),
+            target=_run, args=(sy, ey, target, skip_phase1, skip_phase0),
             daemon=True, name="scraper",
         )
         _thread.start()
@@ -591,6 +737,19 @@ def get_status() -> dict:
     current_pos = _pnr_position_index(max(cy, sy), cm, cd, ci, sy) if cy >= sy else 0
     pct_done    = round(current_pos / total_space * 100, 2) if total_space else 0
 
+    # Phase 0 stats
+    p0_date  = state.get("phase0_date",  "")
+    p0_found = state.get("phase0_found", 0)
+    total_days = (END_YEAR - START_YEAR + 1) * 365
+    p0_pct = 0.0
+    if p0_date:
+        try:
+            p0_d   = date.fromisoformat(p0_date)
+            p0_day = (p0_d - date(START_YEAR, 1, 1)).days
+            p0_pct = round(p0_day / total_days * 100, 1) if total_days else 0
+        except ValueError:
+            pass
+
     # Phase 1 stats
     p1_prefixes = state.get("phase1_prefixes_done", 0)
     p1_vehicles = state.get("phase1_vehicles", 0)
@@ -612,6 +771,10 @@ def get_status() -> dict:
         "phase":                phase,
         "is_running":           is_running(),
         "parallel_workers":     PARALLEL_WORKERS,
+        # Phase 0
+        "phase0_date":          p0_date,
+        "phase0_found":         p0_found,
+        "phase0_pct_done":      p0_pct,
         # Phase 1
         "phase1_prefixes_done": p1_prefixes,
         "phase1_prefixes_total": TOTAL_PREFIXES,
@@ -640,9 +803,12 @@ def maybe_auto_resume() -> None:
     if os.environ.get("AUTO_RESUME", "true").lower() not in ("true", "1", "yes"):
         return
     state = db.get_job_state()
-    if state.get("status") == "running" and (
-        state.get("total_tested", 0) > 0 or state.get("phase1_prefixes_done", 0) > 0
-    ):
+    has_progress = (
+        state.get("total_tested", 0) > 0
+        or state.get("phase1_prefixes_done", 0) > 0
+        or state.get("phase0_found", 0) > 0
+    )
+    if state.get("status") == "running" and has_progress:
         log.info("AUTO_RESUME: resuming from checkpoint.")
         target = state.get("target_people", 0)
         sy     = state.get("start_year", START_YEAR)

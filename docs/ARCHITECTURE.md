@@ -255,77 +255,145 @@ Av dessa ger `make_pnr()` `None` för ogiltiga datum (t.ex. 31 juni,
 ## full_scraper — Docker-arkitektur
 
 `full_scraper/` är en självständig Docker-tjänst som kör på Render med
-persistent disk. Båda faserna körs parallellt i separata trådar.
+persistent disk. Tre faser körs i sekvens/parallell för maximal täckning.
 
-### De två faserna
+### De tre faserna
 
 ```
+Fas 0 — Ratsit-harvesting (smart, ~3–5 dagar, 100% träffgrad)  ← NY
+  Sök Ratsit med varje födelsedag (YYYYMMDD) + könsfilter
+  24 000 dagar × 2 kön = 48 000 sökningar
+  Varje sökning: intercepta /api/search/combined → max 30 träffar
+  Per träff: besök profilsida → intercepta /person/biluppgifter/ →
+    extrahera base64(PNR) från subjectUri → avkoda till PNR
+  PNR → biluppgifter.se/brukare/{b64}/ → spara i people-tabell
+  → ~1,4M personer med fullständig data
+
 Fas 1 — Fordon (snabb, ~1–2 dagar)
   biluppgifter.se /fordon/AAA/ → /fordon/ZZZ/
   17 576 prefix × ~7 sidor/prefix × 100 fordon/sida
   → ~11,4M fordon sparas i vehicles-tabell
   Inga personnummer — ägardata kräver inloggning
 
-Fas 2 — PNR-enumeration (långsam, ~veckor)
+Fas 2 — PNR-enumeration (täcker resten, ~10–14 dagar efter Fas 0)
   Generera alla ~24,5M giltiga PNR (1940–2005, dag 1–31)
   → base64 → biluppgifter.se/brukare/{b64}/
   → parsas → sparas i people-tabell
   Träffrate: ~35–45% (resten har aldrig funnits eller är avregistrerade)
-  Redan kända PNR hoppas över (DB-check innan fetch)
+  Fas 0-PNR är redan i DB → existing_pnrs() hoppar automatiskt över dem
 ```
 
-Fas 1 och Fas 2 körs i **parallella trådar** (`scraper.py` rad 509–521):
+Alla tre faser körs **parallellt** i `_run()`:
 
 ```python
+# Fas 0 i bakgrundstråd (konservativ rate mot Ratsit, 1 Chromium)
+phase0_thread = threading.Thread(target=_run_phase0, daemon=True)
+phase0_thread.start()
+
+# Fas 1 i bakgrundstråd (5 Chromium mot biluppgifter fordonslistor)
 phase1_thread = threading.Thread(target=_run_phase1, daemon=True)
 phase1_thread.start()
-_run_phase2(start_year, end_year, target)   # kör i huvudtråden
-phase1_thread.join()
+
+# Fas 2 i huvudtråden (5 Chromium mot biluppgifter brukarsidor)
+# existing_pnrs() hoppar automatiskt over PNR som Fas 0 redan hittat
+_run_phase2(start_year, end_year, target)
 ```
+
+### Phase 0 i detalj
+
+Ratsit returnerar ~400 personer per datum, men visar max 30 utan inloggning
+(3 sidor × 10 resultat/sida). Kön-splittering (man/kvinna) ger 60 unika per datum.
+
+PNR-utvinning via Ratsit-profilsidor:
+- Ratsit maskerar PNR som `19860528-XXXX` i sökresultaten
+- Men varje profilsida anropar `GET /person/biluppgifter/{hash}`
+- Svaret innehåller `{"subjectUri": "https://biluppgifter.se/brukare/MTk4..."}
+- base64-avkodning: `MTk4NjA1MjgwMjk5` → `198605280299` → `19860528-0299`
+- Verifierat: 30/30 PNR löste sig utan fel vid test med datum 1986-05-28
+
+Filerna som implementerar Fas 0:
+- `ratsit_helper.js` — Playwright-skript, tar `{date, gender}` via stdin, returnerar lista med PNR+metadata
+- `_run_phase0()` i `scraper.py` — itererar datum, anropar `ratsit_helper.js`, hämtar biluppgifter-sidor, sparar i DB
 
 ### Konfiguration (miljövariabler)
 
 ```
-PAGE_PAUSE=0.3           sekunder mellan requests per worker
+PAGE_PAUSE=0.3           sekunder mellan requests per worker (Fas 1 + 2)
+PHASE0_PAUSE=1.0         sekunder mellan requests mot Ratsit (Fas 0)
 BATCH_SIZE=30            PNR per fetch_helper.js-anrop
-PARALLEL_WORKERS=5       parallella Chromium-instanser per fas
+PARALLEL_WORKERS=5       parallella Chromium-instanser per fas (Fas 1 + 2)
 START_YEAR=1940          första födelseåret att enumerera
 END_YEAR=2005            sista födelseåret
 AUTO_RESUME=true         återuppta automatiskt vid omstart
 ```
 
-### Hastighetstaket
+### Hastighetstaket och tidsuppskattning
+
+Alla tre faser körs parallellt. Den totala tiden bestäms av den
+långsammaste fasen (Fas 2), men Fas 0 minskar Fas 2:s arbete löpande.
 
 ```
-5 workers × (1 / 0.3s paus) ≈ 16 URL/sekund
-24 500 000 PNR ÷ 16/s ≈ 1 530 000 s ≈ 18 dagar (teoretiskt)
+Fas 0: ~160s per datum × 2 kön ≈ 5 min/datum (sekventiell, 1 Chromium)
+       Körs parallellt i bakgrunden, slutar inte förrän alla datum testats.
+       ~1.4M PNR sparas → Phase 2 hoppar automatiskt över dem.
+
+Fas 1: ~2 dagar (fordon, 5 workers parallellt)
+
+Fas 2: 5 workers × (1 / 0.3s paus) ≈ 16 URL/s
+       24.5M PNR totalt, varav ~1.4M hoppas över (Fas 0-fynd)
+       Sparar ~1.4M × 0.06s/URL ≈ 23 timmar (≈1 dag) jämfört med utan Fas 0.
+       Total Fas 2-tid: ~17 dagar (ned från ~18)
 ```
 
-**Flaskhalsen är Cloudflare, inte CPU eller RAM.** Ökar man
-`PARALLEL_WORKERS` för högt börjar CF blockera med 403.
+**Fas 0-flaskhalsen:** Ratsit tillåter inte parallella sökningar utan risk för blockering.
+`PHASE0_PAUSE=1.0s` är konservativt; i praktiken tar varje profil-besök 1–3s.
+Fas 0 använder bara 1 Chromium-instans → låg RAM-påverkan (~150 MB extra).
+
+**Fas 1+2-flaskhalsen:** Cloudflare på biluppgifter.se.
 Testat safe-område: 3–8 workers med 0.3s paus.
+
+**Netto-tidsvinst:** ~1 dag snabbare totalt. Fas 0 adderar däremot ~1.4M
+verifierade personer med 100% träffgrad (via Ratsit → PNR → biluppgifter),
+jämfört med brute-force:ens ~35-45% träffgrad.
 
 ### Checkpointing och resume
 
-`job_state`-tabellen i SQLite sparar exakt position:
-`(current_year, current_month, current_day, current_individ)`.
+`job_state`-tabellen i SQLite sparar exakt position för alla tre faser:
+
+| Kolumn | Fas |
+|---|---|
+| `phase0_date` | Senast behandlade datum i Fas 0 (YYYY-MM-DD) |
+| `phase0_found` | Antal personer hittade i Fas 0 |
+| `phase1_prefix` | Senast behandlade prefix i Fas 1 |
+| `phase1_prefixes_done` / `phase1_vehicles` | Fas 1 framsteg |
+| `current_year/month/day/individ` | Position i Fas 2 |
+| `total_tested` / `total_found` | Fas 2 räknare |
 
 Vid omstart (deploy, OOM-crash, manuell restart):
 1. Databasen ligger på persistent disk (`/var/data/people.db`)
-2. `AUTO_RESUME=true` startar om från senaste checkpoint
+2. `AUTO_RESUME=true` startar om från senaste checkpoint för alla tre faser
 3. `INSERT OR IGNORE` förhindrar dubbletter
-4. `existing_pnrs()` hoppar över redan kända PNR innan fetch
+4. `existing_pnrs()` hoppar över redan kända PNR innan fetch (sparar HTTP)
 
 Enda sättet att börja om helt: `POST /job/reset` (raderar alla tabeller).
+
+### API — kontrollera och hoppa över faser
+
+```
+POST /job/start?skip_phase0=true   hoppa över Fas 0 (Ratsit-harvesting)
+POST /job/start?skip_phase1=true   hoppa över Fas 1 (fordon-enumeration)
+POST /job/start?skip_phase0=true&skip_phase1=true   bara Fas 2
+```
 
 ### Optimeringar implementerade
 
 | Optimering | Effekt |
 |---|---|
+| **Fas 0: Ratsit-harvesting** | ~1,4M personer med 100% träffgrad, ~3–5 dagar |
 | Dag 1–31 (inte bara 1–28) | +10% av befolkningen som föddes 29–31:a |
 | BATCH_SIZE=30 (var 15) | Amorterar Chromium-startoverhead bättre |
 | Blockera bilder/CSS/fonts | ~60% mindre bandbredd per request |
-| `existing_pnrs()` DB-check | Hoppar över redan hämtade PNR vid resume |
+| `existing_pnrs()` DB-check | Fas 0-PNR hoppas över i Fas 2 automatiskt |
 | Ny browser context per URL | Undviker Cloudflare navigeringsmönster-blockering |
 
 ---

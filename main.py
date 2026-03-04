@@ -198,17 +198,20 @@ def job_start(
     target:      int  = Query(0,     ge=0,             description="Stop after N people found (0 = unlimited)"),
     start_year:  int  = Query(None,  ge=1900, le=2010, description="Override START_YEAR"),
     end_year:    int  = Query(None,  ge=1900, le=2010, description="Override END_YEAR"),
+    skip_phase0: bool = Query(False,                   description="Skip Ratsit date-harvesting (Phase 0)"),
     skip_phase1: bool = Query(False,                   description="Skip vehicle prefix enumeration (Phase 1)"),
 ) -> dict:
     if scraper.is_running():
         raise HTTPException(status_code=409, detail="Scraper is already running.")
 
     ok = scraper.start(target=target, start_year=start_year,
-                       end_year=end_year, skip_phase1=skip_phase1)
+                       end_year=end_year, skip_phase1=skip_phase1,
+                       skip_phase0=skip_phase0)
     if not ok:
         raise HTTPException(status_code=409, detail="Could not start scraper.")
 
-    return {"started": True, "target": target, "skip_phase1": skip_phase1}
+    return {"started": True, "target": target,
+            "skip_phase0": skip_phase0, "skip_phase1": skip_phase1}
 
 
 @app.post("/job/reset", tags=["job"])
