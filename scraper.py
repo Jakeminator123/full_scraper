@@ -342,21 +342,24 @@ def _parse_prefix_page(html: str | None) -> tuple[list[dict], int]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _iter_dates(start_year: int, end_year: int, resume_date: str = "") -> Generator[date, None, None]:
-    """Yield all dates from start_year-01-01 to end_year-12-31, optionally resuming."""
-    start = date(start_year, 1, 1)
-    end   = date(end_year, 12, 31)
+    """Yield dates from end_year-12-31 DOWN TO start_year-01-01 (reverse order).
+
+    Phase 0 works backwards so it covers different dates than Phase 2
+    (which iterates forwards from start_year). They meet in the middle.
+    """
+    current = date(end_year, 12, 31)
+    stop    = date(start_year, 1, 1)
 
     if resume_date:
         try:
             resumed = date.fromisoformat(resume_date)
-            start = resumed + timedelta(days=1)
+            current = resumed - timedelta(days=1)
         except ValueError:
             pass
 
-    current = start
-    while current <= end:
+    while current >= stop:
         yield current
-        current += timedelta(days=1)
+        current -= timedelta(days=1)
 
 
 def _ratsit_harvest(date_str: str, gender: str) -> list[dict]:
@@ -412,6 +415,7 @@ def _run_phase0(start_year: int, end_year: int) -> None:
 
         date_str = d.isoformat()
 
+        date_new = 0
         for gender in ("m", "f"):
             if _stop_event.is_set():
                 db.update_job_state(status="paused", phase="phase0",
@@ -419,15 +423,18 @@ def _run_phase0(start_year: int, end_year: int) -> None:
                 return
 
             hits = _ratsit_harvest(date_str, gender)
+            g_label = "M" if gender == "m" else "F"
             if not hits:
+                log.info("Phase 0: %s %s → 0 PNR from Ratsit", date_str, g_label)
                 continue
 
-            # Check which PNRs we already have before fetching biluppgifter
             pnr_list = [h["pnr"] for h in hits if h.get("pnr")]
             known    = db.existing_pnrs(pnr_list)
             to_fetch = [h for h in hits if h.get("pnr") and h["pnr"] not in known]
 
-            # Fetch biluppgifter for new PNRs
+            log.info("Phase 0: %s %s → %d PNR, %d new, %d already in DB",
+                     date_str, g_label, len(pnr_list), len(to_fetch), len(known))
+
             if to_fetch:
                 urls     = [_pnr_to_url(h["pnr"]) for h in to_fetch]
                 html_map = _fetch_batch(urls)
@@ -441,6 +448,7 @@ def _run_phase0(start_year: int, end_year: int) -> None:
                     if person:
                         db.insert_person(person)
                         found += 1
+                        date_new += 1
 
         dates_processed += 1
         db.update_job_state(
@@ -448,9 +456,8 @@ def _run_phase0(start_year: int, end_year: int) -> None:
             phase0_found=found,
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
-
-        if dates_processed % 100 == 0:
-            log.info("Phase 0: %d dates processed, %d people found", dates_processed, found)
+        log.info("Phase 0: %s done — +%d new, %d total found, %d dates done",
+                 date_str, date_new, found, dates_processed)
 
     log.info("Phase 0 complete: %d dates, %d people found", dates_processed, found)
     db.update_job_state(phase="phase0_done", phase0_found=found)
