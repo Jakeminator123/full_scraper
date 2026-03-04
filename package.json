@@ -1,0 +1,9 @@
+{
+  "name": "full-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright bridge for biluppgifter.se scraping",
+  "dependencies": {
+    "playwright": "^1.44.0"
+  }
+}

@@ -1,0 +1,32 @@
+# render.yaml — Render deployment config for full-scraper
+#
+# Copy this file to the ROOT of your git repository, push, then:
+# Render dashboard → New → Blueprint → select your repo.
+
+services:
+  - type: web
+    name: full-scraper
+    runtime: docker
+    dockerfilePath: skrapning_ratsit/full_scraper/Dockerfile
+    dockerContext: skrapning_ratsit/full_scraper
+    plan: standard
+    healthCheckPath: /health
+    disk:
+      name: scraper-data
+      mountPath: /var/data
+      sizeGB: 10
+    envVars:
+      - key: API_KEY
+        generateValue: true
+      - key: START_YEAR
+        value: "1940"
+      - key: END_YEAR
+        value: "2005"
+      - key: PAGE_PAUSE
+        value: "0.5"
+      - key: BATCH_SIZE
+        value: "20"
+      - key: AUTO_RESUME
+        value: "true"
+      - key: DATA_DIR
+        value: "/var/data"
