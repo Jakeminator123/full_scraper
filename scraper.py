@@ -48,7 +48,7 @@ RATSIT_JS        = os.path.join(APP_DIR, "ratsit_helper.js")
 PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.3"))
 PHASE0_PAUSE     = float(os.environ.get("PHASE0_PAUSE",     "1.0"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "30"))
-PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "3"))
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "4"))
 START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
 END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
 
