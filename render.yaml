@@ -26,6 +26,10 @@ services:
         value: "0.5"
       - key: BATCH_SIZE
         value: "20"
+      - key: TARGET_PEOPLE_DEFAULT
+        value: "10400000"
+      - key: HEARTBEAT_STALE_SECONDS
+        value: "300"
       - key: AUTO_RESUME
         value: "true"
       - key: DATA_DIR

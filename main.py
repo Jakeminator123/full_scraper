@@ -23,6 +23,7 @@ import logging
 import os
 import signal
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -45,7 +46,9 @@ def _handle_sigterm(signum, frame):
     """Docker sends SIGTERM on stop/redeploy. Gracefully stop the scraper so
     the current batch finishes and checkpoint is saved before the process dies."""
     log.info("SIGTERM received — stopping scraper gracefully")
-    scraper.stop()
+    drained = scraper.stop(wait=True, timeout=25.0)
+    if not drained:
+        log.warning("Scraper did not stop before timeout; process may be terminated by platform.")
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -57,7 +60,7 @@ async def lifespan(application):
     scraper.maybe_auto_resume()
     yield
     log.info("Shutting down — stopping scraper")
-    scraper.stop()
+    scraper.stop(wait=True, timeout=20.0)
 
 app = FastAPI(
     title="Full Population Scraper API",
@@ -101,10 +104,50 @@ def health() -> dict:
 @app.get("/status", tags=["job"])
 def status(_: Auth) -> dict:
     s = scraper.get_status()
-    s["total_people_in_db"]      = db.count_people()
+    total_people = db.count_people()
+    s["total_people_in_db"]      = total_people
     s["people_with_vehicles"]    = db.count_people(har_fordon=1)
     s["people_without_vehicles"] = db.count_people(har_fordon=0)
     s["total_vehicles_in_db"]    = db.count_vehicles()
+
+    # Rolling speed metrics are persisted so ETA survives container redeploys.
+    snap = db.update_status_snapshot(total_people, int(s.get("total_tested", 0)))
+    s["speed_people_per_hour"] = float(snap.get("speed_people_per_hour", s.get("speed_people_per_hour", 0)) or 0)
+    s["speed_tested_per_hour"] = float(snap.get("speed_tested_per_hour", s.get("speed_tested_per_hour", 0)) or 0)
+
+    target_goal = int(s.get("target_people_goal", 0) or 0)
+    if target_goal > 0:
+        now = datetime.now()
+        remaining = max(0, target_goal - total_people)
+        s["people_remaining_to_goal"] = remaining
+        s["goal_progress_pct"] = round(min(100.0, (total_people / target_goal) * 100), 2)
+
+        # If rolling speed has not stabilised yet, use average speed since started_at.
+        people_speed = float(s.get("speed_people_per_hour", 0) or 0)
+        if people_speed <= 0 and s.get("started_at"):
+            try:
+                elapsed_h = max((now - datetime.fromisoformat(str(s["started_at"]))).total_seconds() / 3600.0, 1e-6)
+                people_speed = total_people / elapsed_h
+            except (ValueError, TypeError):
+                people_speed = 0.0
+        s["speed_people_per_hour"] = round(people_speed, 2)
+
+        if remaining == 0:
+            s["eta_seconds_to_goal"] = 0
+            s["eta_at"] = now.isoformat(timespec="seconds")
+        elif people_speed > 0:
+            eta_seconds = int((remaining / people_speed) * 3600)
+            s["eta_seconds_to_goal"] = eta_seconds
+            s["eta_at"] = (now + timedelta(seconds=eta_seconds)).isoformat(timespec="seconds")
+        else:
+            s["eta_seconds_to_goal"] = None
+            s["eta_at"] = ""
+    else:
+        s["people_remaining_to_goal"] = None
+        s["goal_progress_pct"] = None
+        s["eta_seconds_to_goal"] = None
+        s["eta_at"] = ""
+
     return s
 
 
@@ -207,7 +250,7 @@ def export_sqlite(_: Auth) -> StreamingResponse:
 @app.post("/job/start", tags=["job"])
 def job_start(
     _: Auth,
-    target:      int  = Query(0,     ge=0,             description="Stop after N people found (0 = unlimited)"),
+    target:      int  = Query(0,     ge=0,             description="Stop after N people found (0 = unlimited; dashboard still tracks TARGET_PEOPLE_DEFAULT)"),
     start_year:  int  = Query(None,  ge=1900, le=2010, description="Override START_YEAR"),
     end_year:    int  = Query(None,  ge=1900, le=2010, description="Override END_YEAR"),
     skip_phase0: bool = Query(False,                   description="Skip Ratsit date-harvesting (Phase 0)"),
@@ -222,8 +265,13 @@ def job_start(
     if not ok:
         raise HTTPException(status_code=409, detail="Could not start scraper.")
 
-    return {"started": True, "target": target,
-            "skip_phase0": skip_phase0, "skip_phase1": skip_phase1}
+    return {
+        "started": True,
+        "target": target,
+        "target_goal": target if target > 0 else scraper.TARGET_PEOPLE_DEFAULT,
+        "skip_phase0": skip_phase0,
+        "skip_phase1": skip_phase1,
+    }
 
 
 @app.post("/job/reset", tags=["job"])

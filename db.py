@@ -10,6 +10,7 @@ Tables:
 import sqlite3
 import os
 import threading
+from datetime import datetime
 from typing import Any, Generator
 
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
@@ -94,6 +95,13 @@ def init_db() -> None:
         # Phase 0 columns (added in v3)
         "ALTER TABLE job_state ADD COLUMN phase0_date TEXT DEFAULT ''",
         "ALTER TABLE job_state ADD COLUMN phase0_found INTEGER DEFAULT 0",
+        # Heartbeat + status snapshot fields (added in v4)
+        "ALTER TABLE job_state ADD COLUMN last_progress_at TEXT DEFAULT ''",
+        "ALTER TABLE job_state ADD COLUMN status_snapshot_at TEXT DEFAULT ''",
+        "ALTER TABLE job_state ADD COLUMN status_snapshot_people INTEGER DEFAULT 0",
+        "ALTER TABLE job_state ADD COLUMN status_snapshot_tested INTEGER DEFAULT 0",
+        "ALTER TABLE job_state ADD COLUMN speed_people_per_hour REAL DEFAULT 0",
+        "ALTER TABLE job_state ADD COLUMN speed_tested_per_hour REAL DEFAULT 0",
     ]
     for sql in migrations:
         try:
@@ -126,15 +134,76 @@ def save_checkpoint(
     year: int, month: int, day: int, individ: int,
     tested: int, found: int, not_found: int, errors: int,
 ) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
     _conn().execute(
         """UPDATE job_state SET
                current_year=?, current_month=?, current_day=?, current_individ=?,
                total_tested=?, total_found=?, total_not_found=?, total_errors=?,
-               updated_at=datetime('now','localtime')
+               updated_at=?, last_progress_at=?
            WHERE id=1""",
-        (year, month, day, individ, tested, found, not_found, errors),
+        (year, month, day, individ, tested, found, not_found, errors, now, now),
     )
     _conn().commit()
+
+
+def mark_progress() -> str:
+    """Touch heartbeat fields when workers make progress."""
+    now = datetime.now().isoformat(timespec="seconds")
+    update_job_state(last_progress_at=now, updated_at=now)
+    return now
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+
+
+def update_status_snapshot(total_people: int, total_tested: int) -> dict[str, float | str]:
+    """
+    Update rolling speed metrics from status polling.
+    Uses EWMA for stable speed/ETA values across restarts.
+    """
+    state = get_job_state()
+    now = datetime.now()
+    now_iso = now.isoformat(timespec="seconds")
+
+    prev_ts = _parse_iso(str(state.get("status_snapshot_at", "")))
+    prev_people = int(state.get("status_snapshot_people", 0) or 0)
+    prev_tested = int(state.get("status_snapshot_tested", 0) or 0)
+    prev_pph = float(state.get("speed_people_per_hour", 0) or 0.0)
+    prev_tph = float(state.get("speed_tested_per_hour", 0) or 0.0)
+
+    people_speed = prev_pph
+    tested_speed = prev_tph
+
+    if prev_ts is not None:
+        elapsed_hours = max((now - prev_ts).total_seconds() / 3600.0, 1e-6)
+        inst_people = max(0.0, (total_people - prev_people) / elapsed_hours)
+        inst_tested = max(0.0, (total_tested - prev_tested) / elapsed_hours)
+        alpha = 0.35
+        people_speed = inst_people if prev_pph <= 0 else (alpha * inst_people + (1 - alpha) * prev_pph)
+        tested_speed = inst_tested if prev_tph <= 0 else (alpha * inst_tested + (1 - alpha) * prev_tph)
+
+    people_speed = round(people_speed, 2)
+    tested_speed = round(tested_speed, 2)
+
+    update_job_state(
+        status_snapshot_at=now_iso,
+        status_snapshot_people=max(0, int(total_people)),
+        status_snapshot_tested=max(0, int(total_tested)),
+        speed_people_per_hour=people_speed,
+        speed_tested_per_hour=tested_speed,
+    )
+
+    return {
+        "status_snapshot_at": now_iso,
+        "speed_people_per_hour": people_speed,
+        "speed_tested_per_hour": tested_speed,
+    }
 
 
 # ── people ─────────────────────────────────────────────────────────────────────

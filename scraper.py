@@ -51,6 +51,8 @@ BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "30"))
 PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "4"))
 START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
 END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
+TARGET_PEOPLE_DEFAULT = int(os.environ.get("TARGET_PEOPLE_DEFAULT", "10400000"))
+HEARTBEAT_STALE_SECONDS = int(os.environ.get("HEARTBEAT_STALE_SECONDS", "300"))
 
 _thread:     threading.Thread | None = None
 _stop_event: threading.Event          = threading.Event()
@@ -420,13 +422,15 @@ def _run_phase0(start_year: int, end_year: int) -> None:
 
     log.info("Phase 0: Ratsit date-harvesting. Resume from '%s', found so far: %d",
              resume_date or "start", found)
-    db.update_job_state(status="running", phase="phase0")
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    db.update_job_state(status="running", phase="phase0", updated_at=now_iso, last_progress_at=now_iso)
 
     dates_processed = 0
     for d in _iter_dates(start_year, end_year, resume_date):
         if _stop_event.is_set():
             db.update_job_state(status="paused", phase="phase0",
-                                phase0_date=d.isoformat())
+                                phase0_date=d.isoformat(),
+                                updated_at=datetime.now().isoformat(timespec="seconds"))
             log.info("Phase 0 paused at %s", d.isoformat())
             return
 
@@ -436,7 +440,8 @@ def _run_phase0(start_year: int, end_year: int) -> None:
         for gender in ("m", "f"):
             if _stop_event.is_set():
                 db.update_job_state(status="paused", phase="phase0",
-                                    phase0_date=date_str)
+                                    phase0_date=date_str,
+                                    updated_at=datetime.now().isoformat(timespec="seconds"))
                 return
 
             hits = _ratsit_harvest(date_str, gender)
@@ -471,16 +476,19 @@ def _run_phase0(start_year: int, end_year: int) -> None:
                 date_new += batch_inserted
 
         dates_processed += 1
+        now_iso = datetime.now().isoformat(timespec="seconds")
         db.update_job_state(
             phase0_date=date_str,
             phase0_found=found,
-            updated_at=datetime.now().isoformat(timespec="seconds"),
+            updated_at=now_iso,
+            last_progress_at=now_iso,
         )
         log.info("Phase 0: %s done — +%d new, %d total found, %d dates done",
                  date_str, date_new, found, dates_processed)
 
     log.info("Phase 0 complete: %d dates, %d people found", dates_processed, found)
-    db.update_job_state(phase="phase0_done", phase0_found=found)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    db.update_job_state(phase="phase0_done", phase0_found=found, updated_at=now_iso, last_progress_at=now_iso)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -501,18 +509,27 @@ def _run_phase1() -> None:
 
     log.info("Phase 1: prefix enumeration. Resume from '%s', %d prefixes done",
              resume_prefix, prefixes_done)
-    db.update_job_state(status="running", phase="phase1")
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    db.update_job_state(status="running", phase="phase1", updated_at=now_iso, last_progress_at=now_iso)
 
     for prefix in _iter_prefixes(resume_prefix):
         if _stop_event.is_set():
-            db.update_job_state(status="paused", phase1_prefix=prefix)
+            db.update_job_state(
+                status="paused",
+                phase1_prefix=prefix,
+                updated_at=datetime.now().isoformat(timespec="seconds"),
+            )
             log.info("Phase 1 paused at prefix %s", prefix)
             return
 
         page_num = 1
         while True:
             if _stop_event.is_set():
-                db.update_job_state(status="paused", phase1_prefix=prefix)
+                db.update_job_state(
+                    status="paused",
+                    phase1_prefix=prefix,
+                    updated_at=datetime.now().isoformat(timespec="seconds"),
+                )
                 return
 
             urls = []
@@ -550,19 +567,28 @@ def _run_phase1() -> None:
             page_num += PARALLEL_WORKERS
 
         prefixes_done += 1
+        now_iso = datetime.now().isoformat(timespec="seconds")
         db.update_job_state(
             phase1_prefix=prefix,
             phase1_prefixes_done=prefixes_done,
             phase1_vehicles=vehicles_found,
-            updated_at=datetime.now().isoformat(timespec="seconds"),
+            updated_at=now_iso,
+            last_progress_at=now_iso,
         )
         if prefixes_done % 50 == 0:
             log.info("Phase 1: %d/%d prefixes, %d vehicles",
                      prefixes_done, TOTAL_PREFIXES, vehicles_found)
 
     log.info("Phase 1 complete: %d prefixes, %d vehicles", prefixes_done, vehicles_found)
-    db.update_job_state(status="phase1_done", phase="phase1_done",
-                        phase1_prefixes_done=prefixes_done, phase1_vehicles=vehicles_found)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    db.update_job_state(
+        status="phase1_done",
+        phase="phase1_done",
+        phase1_prefixes_done=prefixes_done,
+        phase1_vehicles=vehicles_found,
+        updated_at=now_iso,
+        last_progress_at=now_iso,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -585,10 +611,13 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
         log.info("Phase 2: resuming from %d-%02d-%02d individ %d",
                  resume[0], resume[1], resume[2], resume[3])
 
+    now_iso = datetime.now().isoformat(timespec="seconds")
     db.update_job_state(
         status="running", phase="phase2",
         start_year=start_year, end_year=end_year, target_people=target,
-        started_at=state.get("started_at") or datetime.now().isoformat(timespec="seconds"),
+        started_at=state.get("started_at") or now_iso,
+        updated_at=now_iso,
+        last_progress_at=state.get("last_progress_at") or now_iso,
     )
 
     big_batch_size = BATCH_SIZE * PARALLEL_WORKERS
@@ -644,11 +673,13 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
         for y, mo, d, ind, pnr in _iter_pnrs(start_year, end_year, resume):
             if _stop_event.is_set():
                 flush()
-                db.update_job_state(status="paused")
+                now_iso = datetime.now().isoformat(timespec="seconds")
+                db.update_job_state(status="paused", updated_at=now_iso)
                 return
             if target > 0 and found >= target:
                 flush()
-                db.update_job_state(status="done")
+                now_iso = datetime.now().isoformat(timespec="seconds")
+                db.update_job_state(status="done", updated_at=now_iso, last_progress_at=now_iso)
                 return
 
             batch_pnrs.append(pnr)
@@ -659,11 +690,13 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
 
         flush()
         log.info("Phase 2 complete: tested=%d found=%d", tested, found)
-        db.update_job_state(status="done")
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        db.update_job_state(status="done", updated_at=now_iso, last_progress_at=now_iso)
 
     except Exception as e:
         log.exception("Phase 2 crashed: %s", e)
-        db.update_job_state(status="error")
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        db.update_job_state(status="error", updated_at=now_iso)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -741,8 +774,19 @@ def start(target: int = 0, start_year: int | None = None,
     return True
 
 
-def stop() -> None:
+def stop(wait: bool = False, timeout: float = 30.0) -> bool:
     _stop_event.set()
+    state = db.get_job_state()
+    if state.get("status") == "running":
+        db.update_job_state(status="paused", updated_at=datetime.now().isoformat(timespec="seconds"))
+    if not wait:
+        return False
+    with _state_lock:
+        t = _thread
+    if t is None:
+        return True
+    t.join(timeout=timeout)
+    return not t.is_alive()
 
 
 def is_running() -> bool:
@@ -751,6 +795,7 @@ def is_running() -> bool:
 
 def get_status() -> dict:
     state  = db.get_job_state()
+    now    = datetime.now()
     phase  = state.get("phase", "idle")
     sy     = state.get("start_year",  START_YEAR)
     ey     = state.get("end_year",    END_YEAR)
@@ -763,6 +808,7 @@ def get_status() -> dict:
     n_f    = state.get("total_not_found",0)
     errs   = state.get("total_errors",   0)
     target = state.get("target_people",  0)
+    target_goal = target if target and target > 0 else TARGET_PEOPLE_DEFAULT
 
     total_space = _total_pnr_space(sy, ey)
     current_pos = _pnr_position_index(max(cy, sy), cm, cd, ci, sy) if cy >= sy else 0
@@ -771,13 +817,15 @@ def get_status() -> dict:
     # Phase 0 stats
     p0_date  = state.get("phase0_date",  "")
     p0_found = state.get("phase0_found", 0)
-    total_days = (END_YEAR - START_YEAR + 1) * 365
+    total_days = (date(ey, 12, 31) - date(sy, 1, 1)).days + 1
+    p0_days_done = 0
     p0_pct = 0.0
     if p0_date:
         try:
-            p0_d   = date.fromisoformat(p0_date)
-            p0_day = (p0_d - date(START_YEAR, 1, 1)).days
-            p0_pct = round(p0_day / total_days * 100, 1) if total_days else 0
+            p0_d = date.fromisoformat(p0_date)
+            remaining_days = max(0, (p0_d - date(sy, 1, 1)).days)
+            p0_days_done = max(0, total_days - remaining_days)
+            p0_pct = round(min(100.0, (p0_days_done / total_days) * 100), 1) if total_days else 0.0
         except ValueError:
             pass
 
@@ -797,6 +845,32 @@ def get_status() -> dict:
         except Exception:
             pass
 
+    heartbeat_at = state.get("last_progress_at", "") or state.get("updated_at", "")
+    heartbeat_age = None
+    if heartbeat_at:
+        try:
+            heartbeat_age = max(0, int((now - datetime.fromisoformat(heartbeat_at)).total_seconds()))
+        except ValueError:
+            heartbeat_age = None
+    heartbeat_is_stale = (
+        state.get("status", "idle") == "running"
+        and heartbeat_age is not None
+        and heartbeat_age > HEARTBEAT_STALE_SECONDS
+    )
+
+    running_local = is_running()
+    if state.get("status", "idle") == "running" and not running_local:
+        runtime_state = "resuming"
+    elif heartbeat_is_stale:
+        runtime_state = "stalled"
+    elif running_local:
+        runtime_state = "healthy"
+    else:
+        runtime_state = state.get("status", "idle")
+
+    speed_people = float(state.get("speed_people_per_hour", 0) or 0)
+    speed_tested = float(state.get("speed_tested_per_hour", 0) or 0)
+
     return {
         "status":               state.get("status", "idle"),
         "phase":                phase,
@@ -806,6 +880,8 @@ def get_status() -> dict:
         "phase0_date":          p0_date,
         "phase0_found":         p0_found,
         "phase0_pct_done":      p0_pct,
+        "phase0_days_done":     p0_days_done,
+        "phase0_days_total":    total_days,
         # Phase 1
         "phase1_prefixes_done": p1_prefixes,
         "phase1_prefixes_total": TOTAL_PREFIXES,
@@ -823,8 +899,18 @@ def get_status() -> dict:
         "total_errors":         errs,
         "hit_rate_pct":         round(found / tested * 100, 1) if tested else 0,
         "target_people":        target,
+        "target_people_goal":   target_goal,
+        "target_people_default": TARGET_PEOPLE_DEFAULT,
         "db_size_mb":           round(db.db_file_size_mb(), 1),
         "eta_seconds":          eta_seconds,
+        "eta_phase2_seconds":   eta_seconds,
+        "speed_people_per_hour": speed_people,
+        "speed_tested_per_hour": speed_tested,
+        "heartbeat_at":         heartbeat_at,
+        "heartbeat_age_seconds": heartbeat_age,
+        "heartbeat_is_stale":   heartbeat_is_stale,
+        "runtime_state":        runtime_state,
+        "heartbeat_stale_after_seconds": HEARTBEAT_STALE_SECONDS,
         "started_at":           started,
         "updated_at":           state.get("updated_at", ""),
     }
