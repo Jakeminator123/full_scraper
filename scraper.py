@@ -175,24 +175,30 @@ def _fetch_batch(url_list: list[str]) -> dict[str, str | None]:
     """Run fetch_helper.js with a batch of URLs. Returns {url: html|None}."""
     if not url_list:
         return {}
+    proc = None
     try:
-        r = subprocess.run(
+        proc = subprocess.Popen(
             ["node", FETCH_JS, "--stdin"],
-            input=json.dumps(url_list),
-            capture_output=True,
-            text=True,
-            timeout=int(PAGE_PAUSE * len(url_list) * 3 + 90),
-            cwd=APP_DIR,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=APP_DIR,
         )
-        if r.returncode != 0:
-            log.warning("fetch_helper error: %s", r.stderr.strip()[:200])
+        timeout_sec = int(PAGE_PAUSE * len(url_list) * 3 + 90)
+        stdout, stderr = proc.communicate(input=json.dumps(url_list), timeout=timeout_sec)
+        if proc.returncode != 0:
+            log.warning("fetch_helper error: %s", (stderr or "").strip()[:200])
             return {u: None for u in url_list}
-        return json.loads(r.stdout)
+        return json.loads(stdout)
     except subprocess.TimeoutExpired:
-        log.warning("fetch_helper timeout for %d urls", len(url_list))
+        log.warning("fetch_helper timeout for %d urls — killing process", len(url_list))
+        if proc:
+            proc.kill()
+            proc.wait()
         return {u: None for u in url_list}
     except Exception as e:
         log.error("fetch_helper exception: %s", e)
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
         return {u: None for u in url_list}
 
 
@@ -370,26 +376,32 @@ def _ratsit_harvest(date_str: str, gender: str) -> list[dict]:
     Returns list of {pnr, name, age, city, gender}.
     """
     payload = json.dumps({"date": date_str, "gender": gender})
+    proc = None
     try:
-        r = subprocess.run(
+        proc = subprocess.Popen(
             ["node", RATSIT_JS, "--stdin"],
-            input=payload,
-            capture_output=True,
-            text=True,
-            timeout=int(PHASE0_PAUSE * 60 + 120),
-            cwd=APP_DIR,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=APP_DIR,
             env={**os.environ, "PHASE0_PAUSE": str(PHASE0_PAUSE)},
         )
-        if r.returncode != 0:
-            log.warning("ratsit_helper error [%s %s]: %s", date_str, gender, r.stderr.strip()[:200])
+        timeout_sec = int(PHASE0_PAUSE * 60 + 120)
+        stdout, stderr = proc.communicate(input=payload, timeout=timeout_sec)
+        if proc.returncode != 0:
+            log.warning("ratsit_helper error [%s %s]: %s", date_str, gender, (stderr or "").strip()[:200])
             return []
-        hits = json.loads(r.stdout)
+        hits = json.loads(stdout)
         return hits if isinstance(hits, list) else []
     except subprocess.TimeoutExpired:
-        log.warning("ratsit_helper timeout [%s %s]", date_str, gender)
+        log.warning("ratsit_helper timeout [%s %s] — killing process", date_str, gender)
+        if proc:
+            proc.kill()
+            proc.wait()
         return []
     except Exception as e:
         log.error("ratsit_helper exception [%s %s]: %s", date_str, gender, e)
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
         return []
 
 
