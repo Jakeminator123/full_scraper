@@ -817,13 +817,14 @@ def maybe_auto_resume() -> None:
     if os.environ.get("AUTO_RESUME", "true").lower() not in ("true", "1", "yes"):
         return
     state = db.get_job_state()
+    status = state.get("status", "idle")
     has_progress = (
         state.get("total_tested", 0) > 0
         or state.get("phase1_prefixes_done", 0) > 0
         or state.get("phase0_found", 0) > 0
     )
-    if state.get("status") == "running" and has_progress:
-        log.info("AUTO_RESUME: resuming from checkpoint.")
+    if status in ("running", "paused") and has_progress:
+        log.info("AUTO_RESUME: status=%s, resuming from checkpoint.", status)
         target = state.get("target_people", 0)
         sy     = state.get("start_year", START_YEAR)
         ey     = state.get("end_year",   END_YEAR)
