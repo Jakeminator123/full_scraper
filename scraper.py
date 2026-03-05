@@ -594,7 +594,6 @@ def _run_phase1() -> None:
     log.info("Phase 1 complete: %d prefixes, %d vehicles", prefixes_done, vehicles_found)
     now_iso = datetime.now().isoformat(timespec="seconds")
     db.update_job_state(
-        status="phase1_done",
         phase="phase1_done",
         phase1_prefixes_done=prefixes_done,
         phase1_vehicles=vehicles_found,
@@ -789,7 +788,8 @@ def start(target: int = 0, start_year: int | None = None,
 def stop(wait: bool = False, timeout: float = 30.0) -> bool:
     _stop_event.set()
     state = db.get_job_state()
-    if state.get("status") == "running":
+    status = state.get("status", "idle")
+    if is_running() and status not in ("paused", "done", "error"):
         db.update_job_state(status="paused", updated_at=datetime.now().isoformat(timespec="seconds"))
     if not wait:
         return False
@@ -871,7 +871,10 @@ def get_status() -> dict:
     )
 
     running_local = is_running()
-    if state.get("status", "idle") == "running" and not running_local:
+    status = state.get("status", "idle")
+    has_any_progress = tested > 0 or p1_prefixes > 0 or p0_found > 0
+    in_progress_status = status in ("running", "phase0_done", "phase1_done")
+    if in_progress_status and not running_local and has_any_progress:
         runtime_state = "resuming"
     elif heartbeat_is_stale:
         runtime_state = "stalled"
@@ -938,7 +941,13 @@ def maybe_auto_resume() -> None:
         or state.get("phase1_prefixes_done", 0) > 0
         or state.get("phase0_found", 0) > 0
     )
-    if status in ("running", "paused") and has_progress:
+    terminal_statuses = {"idle", "done", "error"}
+    has_checkpoint = (
+        state.get("current_year", 0) > 0
+        or state.get("phase1_prefixes_done", 0) > 0
+        or state.get("phase0_found", 0) > 0
+    )
+    if status not in terminal_statuses and has_progress and has_checkpoint:
         log.info("AUTO_RESUME: status=%s, resuming from checkpoint.", status)
         target = state.get("target_people", 0)
         sy     = state.get("start_year", START_YEAR)
