@@ -1,14 +1,14 @@
 # render.yaml — Render deployment config for full-scraper
 #
-# Copy this file to the ROOT of your git repository, push, then:
+# This file lives at the root of the full_scraper git repo.
 # Render dashboard → New → Blueprint → select your repo.
 
 services:
   - type: web
     name: full-scraper
     runtime: docker
-    dockerfilePath: skrapning_ratsit/full_scraper/Dockerfile
-    dockerContext: skrapning_ratsit/full_scraper
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     plan: standard
     healthCheckPath: /health
     disk:

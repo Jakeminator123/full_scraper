@@ -401,6 +401,23 @@ def _run_phase0(start_year: int, end_year: int) -> None:
     resume_date = state.get("phase0_date", "")
     found       = state.get("phase0_found", 0)
 
+    # Recovery for older checkpoints created before reverse-iteration phase0.
+    # Old runs could leave phase0_date at START_YEAR-01-01 with zero findings,
+    # which makes reverse iteration think there's nothing left to do.
+    if resume_date and found == 0:
+        try:
+            resumed = date.fromisoformat(resume_date)
+            if resumed <= date(start_year, 1, 1):
+                log.warning(
+                    "Phase 0 checkpoint looks stale (%s, found=0). "
+                    "Resetting phase0 checkpoint to restart from end_year.",
+                    resume_date,
+                )
+                resume_date = ""
+                db.update_job_state(phase0_date="", phase0_found=0)
+        except ValueError:
+            pass
+
     log.info("Phase 0: Ratsit date-harvesting. Resume from '%s', found so far: %d",
              resume_date or "start", found)
     db.update_job_state(status="running", phase="phase0")
