@@ -48,7 +48,7 @@ RATSIT_JS        = os.path.join(APP_DIR, "ratsit_helper.js")
 PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.5"))
 PHASE0_PAUSE     = float(os.environ.get("PHASE0_PAUSE",     "1.5"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "25"))
-PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "4"))
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "6"))
 START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
 END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
 TARGET_PEOPLE_DEFAULT = int(os.environ.get("TARGET_PEOPLE_DEFAULT", "10400000"))
@@ -848,14 +848,13 @@ def _run_phase3() -> None:
 
 def _run(start_year: int, end_year: int, target: int,
          skip_phase1: bool = False, skip_phase0: bool = False) -> None:
-    """Run scraping phases to stay within 4 GB RAM.
+    """Run scraping phases SEQUENTIALLY to stay within 4 GB RAM.
 
     Order:
-      1. Phase 0 (Ratsit date-harvest) — runs alone, 1 Chromium
+      1. Phase 0 (Ratsit date-harvest) — alone, 1 Chromium
       2. Phase 1 (vehicles) — background during Phase 2
-      3. Phase 2 (PNR brute-force) — main workload
-      4. Phase 3 (Ratsit enrichment) — background during Phase 2,
-         enriches people found by Phase 2 with kön/GPS/telefon
+      3. Phase 2 (PNR brute-force) — main workload, full CPU
+      4. Phase 3 (Ratsit enrichment) — AFTER Phase 2, alone
     """
     try:
         state = db.get_job_state()
@@ -882,14 +881,7 @@ def _run(start_year: int, end_year: int, target: int,
             bg_threads.append(phase1_thread)
             log.info("Phase 1 started in background thread")
 
-        # Phase 3: enrichment in background (1 Chromium, conservative rate)
-        phase3_thread = threading.Thread(
-            target=_run_phase3, daemon=True, name="phase3")
-        phase3_thread.start()
-        bg_threads.append(phase3_thread)
-        log.info("Phase 3 (enrichment) started in background thread")
-
-        # Phase 2 runs in main thread
+        # Phase 2 runs in main thread — gets full CPU/RAM
         if not _stop_event.is_set():
             _run_phase2(start_year, end_year, target)
 
@@ -898,6 +890,11 @@ def _run(start_year: int, end_year: int, target: int,
             if t.is_alive():
                 log.info("Waiting for %s to finish...", t.name)
                 t.join()
+
+        # Phase 3: enrichment — runs AFTER Phase 2, alone
+        if not _stop_event.is_set() and db.count_unenriched() > 0:
+            log.info("Phase 3 (Ratsit enrichment) starting — runs alone after Phase 2")
+            _run_phase3()
 
     except Exception as e:
         log.exception("Scraper crashed: %s", e)
