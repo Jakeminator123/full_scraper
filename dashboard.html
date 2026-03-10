@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>full_scraper — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+  :root{--bg:#0f1117;--card:#1a1d27;--border:#2a2d3a;--text:#e4e4e7;
+    --dim:#71717a;--accent:#6366f1;--green:#22c55e;--yellow:#eab308;
+    --red:#ef4444;--blue:#3b82f6;--cyan:#06b6d4;--purple:#a855f7;
+    --radius:12px;--font:'Segoe UI',system-ui,-apple-system,sans-serif}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:var(--font);
+    font-size:14px;line-height:1.5;padding:20px}
+  .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}
+  .grid-2{grid-template-columns:1fr 1fr}
+  .card{background:var(--card);border:1px solid var(--border);
+    border-radius:var(--radius);padding:20px;position:relative}
+  .card h3{color:var(--dim);font-size:11px;text-transform:uppercase;
+    letter-spacing:1.5px;margin-bottom:8px}
+  .big{font-size:32px;font-weight:700;font-variant-numeric:tabular-nums}
+  .sub{color:var(--dim);font-size:12px;margin-top:2px}
+  .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px}
+  .dot-running{background:var(--green);animation:pulse 1.5s infinite}
+  .dot-paused{background:var(--yellow)}.dot-idle{background:var(--dim)}
+  .dot-error{background:var(--red)}.dot-done{background:var(--blue)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .bar-track{height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:8px}
+  .bar-fill{height:100%;border-radius:4px;transition:width .5s ease}
+  .bar-accent{background:linear-gradient(90deg,var(--accent),var(--purple))}
+  .bar-green{background:linear-gradient(90deg,var(--green),var(--cyan))}
+  .bar-blue{background:linear-gradient(90deg,var(--blue),var(--cyan))}
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+  header h1{font-size:22px;font-weight:600}
+  header h1 span{color:var(--accent)}
+  .pill{display:inline-flex;align-items:center;padding:4px 12px;
+    border-radius:20px;font-size:12px;font-weight:600;border:1px solid var(--border)}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .btn{padding:8px 16px;border-radius:8px;border:1px solid var(--border);
+    background:var(--card);color:var(--text);cursor:pointer;font-size:13px;
+    font-weight:500;transition:all .15s;display:inline-flex;align-items:center;gap:6px}
+  .btn:hover{border-color:var(--accent);color:var(--accent)}
+  .btn-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn-primary:hover{opacity:.85}
+  .btn-danger{border-color:var(--red);color:var(--red)}
+  .btn-danger:hover{background:var(--red);color:#fff}
+  .btn:disabled{opacity:.35;cursor:not-allowed;pointer-events:none}
+  .log-box{max-height:160px;overflow-y:auto;font-family:'Cascadia Code',monospace;
+    font-size:12px;padding:12px;background:#12141c;border-radius:8px;
+    margin-top:8px;white-space:pre-wrap;color:var(--dim)}
+  .log-err{color:var(--red)}.log-ok{color:var(--green)}.log-info{color:var(--cyan)}
+  .chart-box{max-width:200px;margin:0 auto}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--dim);font-weight:500;padding:6px 8px;
+    border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+  td{padding:6px 8px;border-bottom:1px solid #1f2130}
+  tr:hover td{background:#1f2235}
+  .table-scroll{max-height:350px;overflow-y:auto}
+  .mono{font-family:'Cascadia Code',monospace;font-size:12px}
+  .text-green{color:var(--green)}.text-dim{color:var(--dim)}
+  .text-yellow{color:var(--yellow)}.text-red{color:var(--red)}.text-cyan{color:var(--cyan)}
+  .text-purple{color:var(--purple)}
+  .flex-between{display:flex;justify-content:space-between;align-items:center}
+  .update-indicator{font-size:11px;color:var(--dim)}
+  .kv-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:8px}
+  .kv-grid-3{grid-template-columns:1fr 1fr 1fr}
+  .kv-item{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px}
+  .kv-item b{display:block;color:var(--text);font-size:20px;font-weight:700;letter-spacing:0;text-transform:none}
+  .kv-item .num-green b{color:var(--green)}
+  .small-note{font-size:12px;color:var(--dim);margin-top:8px}
+  .explain-list{margin-top:10px;padding-left:18px;color:var(--dim)}
+  .explain-list li{margin:6px 0}
+  .warn-box{display:none;margin:0 0 12px;padding:8px 10px;border:1px solid var(--yellow);
+    border-radius:8px;color:var(--yellow);font-size:12px}
+  .enrich-bar{display:flex;align-items:center;gap:8px;margin:4px 0}
+  .enrich-bar .label{font-size:11px;color:var(--dim);width:100px;text-transform:uppercase;letter-spacing:.5px}
+  .enrich-bar .track{flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+  .enrich-bar .fill{height:100%;border-radius:3px;transition:width .5s}
+  .enrich-bar .val{font-size:12px;font-weight:600;min-width:60px;text-align:right}
+  footer{text-align:center;color:var(--dim);font-size:11px;margin-top:32px}
+  @media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.grid-2{grid-template-columns:1fr}}
+  @media(max-width:600px){.grid,.grid-2{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div id="login-gate" style="position:fixed;inset:0;z-index:9999;background:var(--bg);
+  display:flex;align-items:center;justify-content:center">
+  <div class="card" style="width:340px;text-align:center">
+    <h3>API-nyckel</h3>
+    <input id="pw-input" type="password" placeholder="Bearer API_KEY"
+      style="width:100%;padding:10px 14px;margin:12px 0;border-radius:8px;border:1px solid var(--border);
+      background:var(--bg);color:var(--text);font-size:14px;text-align:center">
+    <button class="btn btn-primary" style="width:100%" onclick="tryLogin()">Logga in</button>
+    <div id="pw-error" style="color:var(--red);font-size:12px;margin-top:8px;display:none">Fel API-nyckel</div>
+  </div>
+</div>
+
+<header>
+  <h1><span>full_scraper</span> Dashboard</h1>
+  <div>
+    <span class="pill" id="status-pill">
+      <span class="status-dot dot-idle" id="status-dot"></span>
+      <span id="status-text">Connecting...</span>
+    </span>
+    <span class="update-indicator" id="last-update" style="margin-left:12px"></span>
+  </div>
+</header>
+
+<div class="warn-box" id="heartbeat-warning"></div>
+
+<!-- Row 1: Key metrics -->
+<div class="grid">
+  <div class="card">
+    <h3>Personer i databasen</h3>
+    <div class="big text-green" id="m-people">—</div>
+    <div class="sub" id="m-people-sub"></div>
+  </div>
+  <div class="card">
+    <h3>Fordon i databasen</h3>
+    <div class="big" style="color:var(--cyan)" id="m-vehicles">—</div>
+  </div>
+  <div class="card">
+    <h3>Databasstorlek</h3>
+    <div class="big" id="m-dbsize">—</div>
+    <div class="sub" id="m-eta"></div>
+    <div class="sub" id="m-uptime"></div>
+  </div>
+</div>
+
+<!-- Row 2: Phase progress -->
+<div class="grid">
+  <div class="card">
+    <h3>Fas 0 — Ratsit Harvesting</h3>
+    <div class="flex-between">
+      <span class="big" style="color:var(--purple);font-size:24px" id="p0-found">—</span>
+      <span class="sub" id="p0-date"></span>
+    </div>
+    <div class="bar-track"><div class="bar-fill bar-accent" id="p0-bar" style="width:0%"></div></div>
+    <div class="sub" id="p0-pct" style="margin-top:4px"></div>
+  </div>
+  <div class="card">
+    <h3>Fas 1 — Fordon</h3>
+    <div class="flex-between">
+      <span class="big" style="color:var(--cyan);font-size:24px" id="p1-vehicles">—</span>
+      <span class="sub" id="p1-prefix"></span>
+    </div>
+    <div class="bar-track"><div class="bar-fill bar-blue" id="p1-bar" style="width:0%"></div></div>
+    <div class="sub" id="p1-pct" style="margin-top:4px"></div>
+  </div>
+  <div class="card">
+    <h3>Fas 2 — PNR Brute-force</h3>
+    <div class="flex-between">
+      <span class="big" style="color:var(--green);font-size:24px" id="p2-found">—</span>
+      <span class="sub" id="p2-pos"></span>
+    </div>
+    <div class="bar-track"><div class="bar-fill bar-green" id="p2-bar" style="width:0%"></div></div>
+    <div class="sub" id="p2-detail" style="margin-top:4px"></div>
+  </div>
+</div>
+
+<!-- Row 3: Enrichment + Controls -->
+<div class="grid grid-2">
+  <div class="card">
+    <h3>Datakvalitet — berikade uppgifter</h3>
+    <div id="enrich-bars">
+      <div class="enrich-bar"><span class="label">Telefon</span><span class="track"><span class="fill" id="e-phone-bar" style="width:0%;background:var(--green)"></span></span><span class="val text-green" id="e-phone">—</span></div>
+      <div class="enrich-bar"><span class="label">Kön</span><span class="track"><span class="fill" id="e-kon-bar" style="width:0%;background:var(--cyan)"></span></span><span class="val text-cyan" id="e-kon">—</span></div>
+      <div class="enrich-bar"><span class="label">Gift/ogift</span><span class="track"><span class="fill" id="e-gift-bar" style="width:0%;background:var(--blue)"></span></span><span class="val" style="color:var(--blue)" id="e-gift">—</span></div>
+      <div class="enrich-bar"><span class="label">GPS</span><span class="track"><span class="fill" id="e-gps-bar" style="width:0%;background:var(--purple)"></span></span><span class="val text-purple" id="e-gps">—</span></div>
+      <div class="enrich-bar"><span class="label">Bolag</span><span class="track"><span class="fill" id="e-bolag-bar" style="width:0%;background:var(--yellow)"></span></span><span class="val text-yellow" id="e-bolag">—</span></div>
+      <div class="enrich-bar"><span class="label">Tilltalsnamn</span><span class="track"><span class="fill" id="e-namn-bar" style="width:0%;background:var(--accent)"></span></span><span class="val" style="color:var(--accent)" id="e-namn">—</span></div>
+      <div class="enrich-bar"><span class="label">Grannar</span><span class="track"><span class="fill" id="e-grannar-bar" style="width:0%;background:#f97316"></span></span><span class="val" style="color:#f97316" id="e-grannar">—</span></div>
+    </div>
+    <div class="sub" style="margin-top:10px">
+      Källa: <span id="e-src-ratsit">0</span> via Ratsit · <span id="e-src-bil">0</span> via Biluppgifter
+    </div>
+  </div>
+  <div class="card">
+    <h3>Kontroller och export</h3>
+    <div class="actions">
+      <button class="btn btn-primary" id="btn-start" onclick="doStart()">Starta jobb</button>
+      <button class="btn" id="btn-stop" onclick="doStop()">Pausa</button>
+      <button class="btn btn-danger" onclick="doReset()">Reset DB</button>
+    </div>
+    <h3 style="margin-top:16px">Ladda ned databasen</h3>
+    <div class="actions">
+      <button class="btn" onclick="doExport('json')">JSON</button>
+      <button class="btn" onclick="doExport('csv')">CSV</button>
+      <button class="btn" onclick="doExport('sqlite')">SQLite</button>
+    </div>
+    <h3 style="margin-top:16px">Logg</h3>
+    <div class="log-box" id="log-box">Ansluter...</div>
+  </div>
+</div>
+
+<!-- Row 4: Goal forecast + chart -->
+<div class="grid grid-2" style="margin-top:16px">
+  <div class="card">
+    <h3>Målprognos (personer)</h3>
+    <div class="kv-grid">
+      <div class="kv-item">Mål<b id="g-target">—</b></div>
+      <div class="kv-item">Nuvarande<b id="g-current">—</b></div>
+      <div class="kv-item">Kvar<b id="g-remaining">—</b></div>
+      <div class="kv-item">Progress<b id="g-progress">—</b></div>
+      <div class="kv-item">Hastighet<b id="g-speed">—</b></div>
+      <div class="kv-item">ETA<b id="g-eta">—</b></div>
+    </div>
+    <div class="small-note" id="g-eta-at">Beräknad sluttid: —</div>
+  </div>
+  <div class="card">
+    <h3>Datadistribution</h3>
+    <div class="chart-box"><canvas id="pie-chart"></canvas></div>
+  </div>
+</div>
+
+<!-- Row 5: People table -->
+<div class="card" style="margin-top:16px">
+  <div class="flex-between" style="margin-bottom:12px">
+    <h3 style="margin:0">Senast hittade personer</h3>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="search-input" placeholder="Sök namn..." style="padding:6px 12px;
+        border-radius:8px;border:1px solid var(--border);background:var(--bg);
+        color:var(--text);font-size:13px;width:180px">
+      <button class="btn" onclick="loadPeople()">Ladda</button>
+    </div>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead><tr>
+        <th>PNR</th><th>Namn</th><th>Ålder</th><th>Stad</th><th>Adress</th><th>Kön</th><th>Telefon</th><th>Fordon</th><th>Källa</th>
+      </tr></thead>
+      <tbody id="people-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<footer>full_scraper dashboard — polling var 5:e sekund · serverad direkt från Docker</footer>
+
+<script>
+let pieChart = null;
+let prevSnapshot = null;
+let prevTime = null;
+let apiKey = sessionStorage.getItem("dash_apikey") || "";
+
+function tryLogin() {
+  const v = document.getElementById("pw-input").value;
+  if (!v) return;
+  apiKey = v;
+  sessionStorage.setItem("dash_apikey", v);
+  document.getElementById("login-gate").style.display = "none";
+  startPolling();
+}
+document.getElementById("pw-input").addEventListener("keydown", e => {
+  if (e.key === "Enter") tryLogin();
+});
+if (apiKey) document.getElementById("login-gate").style.display = "none";
+
+function fmt(n) { return n != null ? n.toLocaleString("sv-SE") : "—"; }
+
+function logMsg(msg, cls="") {
+  const box = document.getElementById("log-box");
+  const line = document.createElement("div");
+  line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString("sv-SE")}] ${msg}`;
+  box.appendChild(line);
+  if (box.children.length > 60) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+async function fetchApi(path, opts={}) {
+  const headers = { ...(opts.headers || {}), "Authorization": `Bearer ${apiKey}` };
+  const r = await fetch(path, { ...opts, headers });
+  if (r.status === 401) {
+    sessionStorage.removeItem("dash_apikey");
+    apiKey = "";
+    document.getElementById("login-gate").style.display = "flex";
+    document.getElementById("pw-error").style.display = "block";
+    throw new Error("Unauthorized");
+  }
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
+
+function fmtSpeed(perHour) {
+  if (perHour == null || perHour <= 0) return "—";
+  if (perHour >= 1000) return `${(perHour/1000).toFixed(1)}k/h`;
+  return `${Math.round(perHour)}/h`;
+}
+
+function fmtDuration(sec) {
+  if (sec == null || sec <= 0) return "—";
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h ${m}m`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+function enrichBar(id, count, total) {
+  const pct = total > 0 ? Math.min(100, (count / total) * 100) : 0;
+  document.getElementById(id + "-bar").style.width = pct.toFixed(1) + "%";
+  document.getElementById(id).textContent = fmt(count);
+}
+
+async function updateStatus() {
+  try {
+    const s = await fetchApi("/status");
+    const now = Date.now();
+    const status = s.status || "idle";
+    const running = s.is_running;
+
+    const dot = document.getElementById("status-dot");
+    const dotCls = {running:"dot-running",paused:"dot-paused",
+      error:"dot-error",done:"dot-done",idle:"dot-idle"};
+    dot.className = "status-dot " + (dotCls[status] || "dot-idle");
+    document.getElementById("status-text").textContent = `${status} — fas ${s.phase || "idle"}`;
+    document.getElementById("last-update").textContent = new Date().toLocaleTimeString("sv-SE");
+
+    const warn = document.getElementById("heartbeat-warning");
+    if (s.heartbeat_is_stale) {
+      warn.style.display = "block";
+      warn.textContent = `Varning: ingen progress på ${fmt(s.heartbeat_age_seconds)}s.`;
+    } else { warn.style.display = "none"; }
+
+    document.getElementById("btn-start").disabled = running;
+    document.getElementById("btn-start").textContent = running ? "Kör..." : "Starta jobb";
+    document.getElementById("btn-stop").disabled = !running;
+
+    const people = s.total_people_in_db || 0;
+    const withV = s.people_with_vehicles || 0;
+    const withoutV = s.people_without_vehicles || 0;
+    const pSpeed = s.speed_people_per_hour || 0;
+
+    document.getElementById("m-people").textContent = fmt(people);
+    document.getElementById("m-people-sub").textContent =
+      `${fmt(withV)} med fordon · ${fmt(withoutV)} utan · ${fmtSpeed(pSpeed)}`;
+    document.getElementById("m-vehicles").textContent = fmt(s.total_vehicles_in_db || 0);
+    document.getElementById("m-dbsize").textContent = `${s.db_size_mb || 0} MB`;
+    if (s.eta_seconds != null) document.getElementById("m-eta").textContent = `Fas 2 ETA: ${fmtDuration(s.eta_seconds)}`;
+    if (s.started_at) {
+      const st = new Date(s.started_at);
+      if (!isNaN(st)) document.getElementById("m-uptime").textContent = `Aktiv: ${fmtDuration(Math.floor((Date.now()-st)/1000))}`;
+    }
+
+    // Phase 0
+    document.getElementById("p0-found").textContent = fmt(s.phase0_found || 0);
+    document.getElementById("p0-date").textContent = s.phase0_date || "ej startad";
+    document.getElementById("p0-bar").style.width = (s.phase0_pct_done || 0) + "%";
+    const p0phones = s.phase0_phones || 0;
+    document.getElementById("p0-pct").textContent =
+      `${s.phase0_pct_done||0}% · ${fmt(p0phones)} telefonnr · ${s.phase0_days_done||0}/${s.phase0_days_total||0} dagar`;
+
+    // Phase 1
+    document.getElementById("p1-vehicles").textContent = fmt(s.phase1_vehicles || 0);
+    document.getElementById("p1-prefix").textContent = `${fmt(s.phase1_prefixes_done||0)}/${fmt(s.phase1_prefixes_total||17576)}`;
+    document.getElementById("p1-bar").style.width = (s.phase1_pct || 0) + "%";
+    document.getElementById("p1-pct").textContent = `${s.phase1_pct||0}%`;
+
+    // Phase 2
+    document.getElementById("p2-found").textContent = fmt(s.total_found || 0);
+    document.getElementById("p2-pos").textContent = s.current_position || "";
+    document.getElementById("p2-bar").style.width = (s.phase2_pct_done || 0) + "%";
+    document.getElementById("p2-detail").textContent =
+      `${s.phase2_pct_done||0}% · testat ${fmt(s.total_tested||0)} · hit ${s.hit_rate_pct||0}% · err ${fmt(s.total_errors||0)}`;
+
+    // Enrichment bars
+    const e = s.enrichment || {};
+    enrichBar("e-phone", e.med_telefon || 0, people);
+    enrichBar("e-kon", e.med_kon || 0, people);
+    enrichBar("e-gift", e.med_gift || 0, people);
+    enrichBar("e-gps", e.med_gps || 0, people);
+    enrichBar("e-bolag", e.med_bolag || 0, people);
+    enrichBar("e-namn", e.med_tilltalsnamn || 0, people);
+    enrichBar("e-grannar", e.med_grannar || 0, people);
+    document.getElementById("e-src-ratsit").textContent = fmt(e.fran_ratsit || 0);
+    document.getElementById("e-src-bil").textContent = fmt(e.fran_biluppgifter || 0);
+
+    // Goal
+    const goal = s.target_people_goal || 10400000;
+    const remaining = s.people_remaining_to_goal ?? Math.max(0, goal - people);
+    const goalPct = s.goal_progress_pct ?? (goal > 0 ? Math.min(100, (people/goal)*100) : 0);
+    document.getElementById("g-target").textContent = fmt(goal);
+    document.getElementById("g-current").textContent = fmt(people);
+    document.getElementById("g-remaining").textContent = fmt(remaining);
+    document.getElementById("g-progress").textContent = `${goalPct.toFixed(2)}%`;
+    document.getElementById("g-speed").textContent = fmtSpeed(pSpeed);
+    document.getElementById("g-eta").textContent = fmtDuration(s.eta_seconds_to_goal);
+    document.getElementById("g-eta-at").textContent = `Beräknad sluttid: ${s.eta_at || "—"}`;
+
+    // Pie
+    updatePie(withV, withoutV, s.phase0_found || 0);
+  } catch (e) {
+    if (e.message === "Unauthorized") return;
+    document.getElementById("status-text").textContent = "Offline";
+    document.getElementById("status-dot").className = "status-dot dot-error";
+  }
+}
+
+function updatePie(withV, withoutV, p0) {
+  const data = [withV, withoutV, p0];
+  const labels = ["Med fordon", "Utan fordon", "Via Ratsit (Fas 0)"];
+  const colors = ["#06b6d4", "#eab308", "#a855f7"];
+  if (!pieChart) {
+    pieChart = new Chart(document.getElementById("pie-chart"), {
+      type: "doughnut",
+      data: { labels, datasets: [{ data, backgroundColor: colors, borderWidth: 0 }] },
+      options: { cutout: "65%", plugins: { legend: { position: "bottom",
+        labels: { color: "#71717a", font: { size: 11 }, padding: 8, usePointStyle: true } } } }
+    });
+  } else { pieChart.data.datasets[0].data = data; pieChart.update("none"); }
+}
+
+async function loadPeople() {
+  const search = document.getElementById("search-input").value;
+  const params = search ? `?search=${encodeURIComponent(search)}&limit=20` : "?limit=20";
+  try {
+    const d = await fetchApi("/people" + params);
+    const tbody = document.getElementById("people-tbody");
+    tbody.innerHTML = "";
+    for (const p of (d.results || [])) {
+      const tr = document.createElement("tr");
+      const vCls = p.antal_fordon_egna > 0 ? "text-green" : "text-dim";
+      const konLabel = p.kon === "male" ? "M" : p.kon === "female" ? "K" : "";
+      const phoneShort = (p.telefon || "").substring(0, 18);
+      const phoneCls = phoneShort ? "text-green" : "text-dim";
+      const srcCls = (p.kalla || "").includes("ratsit") ? "text-purple" : "text-dim";
+      tr.innerHTML = `
+        <td class="mono">${p.pnr || ""}</td>
+        <td>${p.namn || ""}</td>
+        <td>${p.alder || ""}</td>
+        <td>${p.stad || ""}</td>
+        <td class="text-dim">${(p.gata||"").substring(0,25)}</td>
+        <td>${konLabel}</td>
+        <td class="${phoneCls}">${phoneShort || "—"}</td>
+        <td class="${vCls}">${p.antal_fordon_egna || 0}</td>
+        <td class="${srcCls}">${p.kalla || "—"}</td>`;
+      tbody.appendChild(tr);
+    }
+    logMsg(`Laddade ${d.results?.length || 0} av ${fmt(d.total)} personer`, "log-ok");
+  } catch(e) { logMsg("Fel: " + e.message, "log-err"); }
+}
+
+async function doStart() {
+  try { await fetchApi("/job/start", { method: "POST" }); logMsg("Jobb startat", "log-ok"); updateStatus(); }
+  catch(e) { logMsg("Startfel: " + e.message, "log-err"); }
+}
+async function doStop() {
+  try { await fetchApi("/job/stop", { method: "POST" }); logMsg("Stop-signal skickad", "log-info"); updateStatus(); }
+  catch(e) { logMsg("Stoppfel: " + e.message, "log-err"); }
+}
+async function doReset() {
+  if (!confirm("VARNING: Raderar ALLA data. Säker?")) return;
+  if (!confirm("Helt säker? Går inte att ångra.")) return;
+  try { await fetchApi("/job/reset", { method: "POST" }); logMsg("Databas raderad", "log-err"); updateStatus(); }
+  catch(e) { logMsg("Resetfel: " + e.message, "log-err"); }
+}
+async function doExport(format) {
+  try {
+    const r = await fetch("/export/" + format, { headers: { "Authorization": `Bearer ${apiKey}` } });
+    if (!r.ok) { logMsg("Exportfel: HTTP " + r.status, "log-err"); return; }
+    const blob = await r.blob();
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+    a.download = format === "sqlite" ? "people.db" : "people." + format;
+    a.click(); URL.revokeObjectURL(a.href);
+    logMsg("Export " + format + " nedladdad", "log-info");
+  } catch(e) { logMsg("Exportfel: " + e.message, "log-err"); }
+}
+
+document.getElementById("search-input").addEventListener("keydown", e => { if (e.key === "Enter") loadPeople(); });
+
+let pollTimer = null;
+function startPolling() {
+  if (pollTimer) return;
+  updateStatus(); loadPeople();
+  pollTimer = setInterval(updateStatus, 5000);
+}
+if (apiKey) startPolling();
+</script>
+</body>
+</html>

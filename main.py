@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import db
@@ -93,15 +93,33 @@ Auth = Annotated[None, Depends(require_auth)]
 
 
 DASHBOARD_URL = os.environ.get(
-    "DASHBOARD_URL", "https://full-scraper-dashboard.vercel.app"
+    "DASHBOARD_URL", ""
 )
 
 
-# ── Root redirect ────────────────────────────────────────────────────────────
+# ── Dashboard (served directly from the container) ───────────────────────────
+
+_DASHBOARD_HTML: str | None = None
+
+
+def _load_dashboard() -> str:
+    global _DASHBOARD_HTML
+    if _DASHBOARD_HTML is not None:
+        return _DASHBOARD_HTML
+    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    if os.path.exists(html_path):
+        with open(html_path, encoding="utf-8") as f:
+            _DASHBOARD_HTML = f.read()
+    else:
+        _DASHBOARD_HTML = "<h1>dashboard.html not found</h1>"
+    return _DASHBOARD_HTML
+
 
 @app.get("/", include_in_schema=False)
 def root():
-    return RedirectResponse(DASHBOARD_URL)
+    if DASHBOARD_URL:
+        return RedirectResponse(DASHBOARD_URL)
+    return HTMLResponse(_load_dashboard())
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
