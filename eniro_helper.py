@@ -71,111 +71,136 @@ async def _accept_cookies(page) -> None:
         pass
 
 
-async def search_eniro(pw_browser, name: str, max_results: int = 10) -> list[dict]:
+async def search_eniro(pw_browser, name: str, max_results: int = 10,
+                       timeout_s: float = 45) -> list[dict]:
     """Search Eniro for a name, return list of {eniro_id, url, slug}."""
-    slug = quote_plus(name)
-    url = f"https://www.eniro.se/{slug}/personer"
-    persons = []
+    async def _inner():
+        slug = quote_plus(name)
+        url = f"https://www.eniro.se/{slug}/personer"
+        persons = []
 
-    ctx = await pw_browser.new_context(
-        user_agent=_pick_ua(), locale="sv-SE",
-        viewport={"width": 1366, "height": 768},
-    )
-    page = await ctx.new_page()
+        ctx = await pw_browser.new_context(
+            user_agent=_pick_ua(), locale="sv-SE",
+            viewport={"width": 1366, "height": 768},
+        )
+        page = await ctx.new_page()
+
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            ok = await _cf_wait(page)
+            if not ok:
+                log.warning("Eniro CF timeout for search '%s'", name)
+                return []
+            await _accept_cookies(page)
+            await page.wait_for_timeout(500)
+
+            links = await page.locator("a[href*='/person']").all()
+            seen = set()
+            for link in links:
+                href = await link.get_attribute("href")
+                pid = re.search(r"/(\d{6,12})/person", href or "")
+                if pid and pid.group(1) not in seen:
+                    seen.add(pid.group(1))
+                    full = "https://www.eniro.se" + href if href.startswith("/") else href
+                    persons.append({"eniro_id": pid.group(1), "url": full})
+                if len(persons) >= max_results:
+                    break
+        except Exception as e:
+            log.warning("Eniro search error '%s': %s", name, e)
+        finally:
+            await ctx.close()
+
+        return persons
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        ok = await _cf_wait(page)
-        if not ok:
-            log.warning("Eniro CF timeout for search '%s'", name)
-            return []
-        await _accept_cookies(page)
-        await page.wait_for_timeout(500)
-
-        links = await page.locator("a[href*='/person']").all()
-        seen = set()
-        for link in links:
-            href = await link.get_attribute("href")
-            pid = re.search(r"/(\d{6,12})/person", href or "")
-            if pid and pid.group(1) not in seen:
-                seen.add(pid.group(1))
-                full = "https://www.eniro.se" + href if href.startswith("/") else href
-                persons.append({"eniro_id": pid.group(1), "url": full})
-            if len(persons) >= max_results:
-                break
-    except Exception as e:
-        log.warning("Eniro search error '%s': %s", name, e)
-    finally:
-        await ctx.close()
-
-    return persons
+        return await asyncio.wait_for(_inner(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        log.warning("Eniro search_eniro hard timeout (%ss) for '%s'", timeout_s, name)
+        return []
 
 
-async def fetch_person_page(pw_browser, url: str) -> dict | None:
+async def fetch_person_page(pw_browser, url: str,
+                            timeout_s: float = 40) -> dict | None:
     """Fetch an Eniro person page, extract JSON-LD: birthDate, phone, address."""
-    ctx = await pw_browser.new_context(
-        user_agent=_pick_ua(), locale="sv-SE",
-        viewport={"width": 1366, "height": 768},
-    )
-    page = await ctx.new_page()
+    async def _inner():
+        ctx = await pw_browser.new_context(
+            user_agent=_pick_ua(), locale="sv-SE",
+            viewport={"width": 1366, "height": 768},
+        )
+        page = await ctx.new_page()
+
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            ok = await _cf_wait(page)
+            if not ok:
+                log.warning("Eniro CF timeout for %s", url)
+                return None
+            await _accept_cookies(page)
+            await page.wait_for_timeout(300)
+
+            html = await page.content()
+            person = _extract_jsonld_person(html)
+            if not person.get("name"):
+                return None
+
+            addr = person.get("address", {})
+            return {
+                "namn": person.get("name", ""),
+                "fornamn": person.get("givenName", ""),
+                "efternamn": person.get("familyName", ""),
+                "birthDate": person.get("birthDate", ""),
+                "telefon": person.get("telephone", ""),
+                "gatuadress": addr.get("streetAddress", ""),
+                "postnummer": addr.get("postalCode", ""),
+                "postort": addr.get("addressLocality", ""),
+                "eniro_url": url,
+            }
+        except Exception as e:
+            log.warning("Eniro page error %s: %s", url, e)
+            return None
+        finally:
+            await ctx.close()
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-        ok = await _cf_wait(page)
-        if not ok:
-            log.warning("Eniro CF timeout for %s", url)
-            return None
-        await _accept_cookies(page)
-        await page.wait_for_timeout(300)
-
-        html = await page.content()
-        person = _extract_jsonld_person(html)
-        if not person.get("name"):
-            return None
-
-        addr = person.get("address", {})
-        return {
-            "namn": person.get("name", ""),
-            "fornamn": person.get("givenName", ""),
-            "efternamn": person.get("familyName", ""),
-            "birthDate": person.get("birthDate", ""),
-            "telefon": person.get("telephone", ""),
-            "gatuadress": addr.get("streetAddress", ""),
-            "postnummer": addr.get("postalCode", ""),
-            "postort": addr.get("addressLocality", ""),
-            "eniro_url": url,
-        }
-    except Exception as e:
-        log.warning("Eniro page error %s: %s", url, e)
+        return await asyncio.wait_for(_inner(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        log.warning("Eniro fetch_person_page hard timeout (%ss) for %s", timeout_s, url)
         return None
-    finally:
-        await ctx.close()
 
 
-async def resolve_birthdate(pw_browser, namn: str, stad: str = "") -> dict | None:
+async def resolve_birthdate(pw_browser, namn: str, stad: str = "",
+                            timeout_s: float = 120) -> dict | None:
     """Search Eniro for a person, return birthDate + extras if found.
 
     Tries to match by name. Returns the first match with birthDate.
+    Hard timeout prevents a single person from blocking the whole phase.
     """
-    query = f"{namn} {stad}".strip() if stad else namn
-    persons = await search_eniro(pw_browser, query, max_results=5)
+    async def _inner():
+        query = f"{namn} {stad}".strip() if stad else namn
+        persons = await search_eniro(pw_browser, query, max_results=5)
 
-    if not persons:
+        if not persons:
+            return None
+
+        target_parts = set(namn.lower().split())
+
+        for p in persons:
+            await asyncio.sleep(_jitter(0.5))
+            data = await fetch_person_page(pw_browser, p["url"])
+            if not data or not data.get("birthDate"):
+                continue
+
+            found_parts = set(data["namn"].lower().split())
+            if target_parts & found_parts:
+                return data
+
         return None
 
-    target_parts = set(namn.lower().split())
-
-    for p in persons:
-        await asyncio.sleep(_jitter(0.5))
-        data = await fetch_person_page(pw_browser, p["url"])
-        if not data or not data.get("birthDate"):
-            continue
-
-        found_parts = set(data["namn"].lower().split())
-        if target_parts & found_parts:
-            return data
-
-    return None
+    try:
+        return await asyncio.wait_for(_inner(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        log.warning("Eniro resolve_birthdate hard timeout (%ss) for '%s'", timeout_s, namn)
+        return None
 
 
 def sync_resolve_birthdate(namn: str, stad: str = "") -> dict | None:

@@ -685,10 +685,15 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
     db.update_job_state(phase="phase2e", phase2e_status="running",
                         updated_at=now_iso, last_progress_at=now_iso)
 
+    PERSON_TIMEOUT = 180  # max seconds per person (Eniro + biluppgifter)
+    CONSECUTIVE_ERRORS_RESTART = 3  # restart browser after this many consecutive errors
+
     async def _eniro_loop():
         nonlocal resolved, searched
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
+            consecutive_errors = 0
+
             try:
                 while not _stop_event.is_set():
                     batch = db.get_eniro_pending_pnrs(PHASE2E_BATCH)
@@ -703,71 +708,103 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                         stad = person.get("stad", "")
                         pnr = person.get("pnr", "")
                         if not namn:
+                            db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_skip"})
                             continue
 
                         searched += 1
                         log.info("Phase 2E: searching Eniro for '%s' (%s)", namn, stad)
 
                         try:
-                            eniro_data = await eniro_helper.resolve_birthdate(browser, namn, stad)
+                            eniro_data = await asyncio.wait_for(
+                                eniro_helper.resolve_birthdate(browser, namn, stad),
+                                timeout=PERSON_TIMEOUT,
+                            )
+                            consecutive_errors = 0
+                        except asyncio.TimeoutError:
+                            log.warning("Phase 2E: HARD TIMEOUT (%ds) for '%s' — skipping", PERSON_TIMEOUT, namn)
+                            db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_timeout"})
+                            consecutive_errors += 1
+                            if consecutive_errors >= CONSECUTIVE_ERRORS_RESTART:
+                                log.warning("Phase 2E: %d consecutive errors — restarting browser", consecutive_errors)
+                                try:
+                                    await browser.close()
+                                except Exception:
+                                    pass
+                                browser = await pw.chromium.launch(headless=True)
+                                consecutive_errors = 0
+                            now_iso = datetime.now().isoformat(timespec="seconds")
+                            db.update_job_state(
+                                phase2e_resolved=resolved, phase2e_searched=searched,
+                                updated_at=now_iso, last_progress_at=now_iso,
+                            )
+                            continue
                         except Exception as e:
                             log.warning("Phase 2E: Eniro error for '%s': %s", namn, e)
+                            db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_error"})
+                            consecutive_errors += 1
+                            if consecutive_errors >= CONSECUTIVE_ERRORS_RESTART:
+                                log.warning("Phase 2E: %d consecutive errors — restarting browser", consecutive_errors)
+                                try:
+                                    await browser.close()
+                                except Exception:
+                                    pass
+                                browser = await pw.chromium.launch(headless=True)
+                                consecutive_errors = 0
                             continue
 
                         if not eniro_data or not eniro_data.get("birthDate"):
                             log.info("Phase 2E: no birthDate for '%s'", namn)
                             db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_miss"})
-                            continue
+                        else:
+                            birth = eniro_data["birthDate"]
+                            telefon_eniro = eniro_data.get("telefon", "")
+                            postnr = eniro_data.get("postnummer", "")
 
-                        birth = eniro_data["birthDate"]
-                        telefon_eniro = eniro_data.get("telefon", "")
-                        postnr = eniro_data.get("postnummer", "")
+                            enrich_fields = {"kalla": "biluppgifter+eniro"}
+                            if telefon_eniro:
+                                enrich_fields["telefon"] = telefon_eniro
+                            if postnr:
+                                enrich_fields["postnummer"] = postnr
 
-                        enrich_fields = {"kalla": "biluppgifter+eniro"}
-                        if telefon_eniro:
-                            enrich_fields["telefon"] = telefon_eniro
-                        if postnr:
-                            enrich_fields["postnummer"] = postnr
+                            candidates = _birthdate_to_candidates(birth)
+                            log.info("Phase 2E: '%s' born %s → %d PNR candidates, testing...",
+                                     namn, birth, len(candidates))
 
-                        candidates = _birthdate_to_candidates(birth)
-                        log.info("Phase 2E: '%s' born %s → %d PNR candidates, testing...",
-                                 namn, birth, len(candidates))
+                            target_parts = set(namn.lower().split())
+                            matched = False
 
-                        target_parts = set(namn.lower().split())
-                        matched = False
+                            for i in range(0, len(candidates), BATCH_SIZE):
+                                if _stop_event.is_set():
+                                    break
+                                chunk = candidates[i:i + BATCH_SIZE]
+                                urls = [_pnr_to_url(c) for c in chunk]
+                                html_map = _fetch_batch(urls)
 
-                        for i in range(0, len(candidates), BATCH_SIZE):
-                            if _stop_event.is_set():
-                                break
-                            chunk = candidates[i:i + BATCH_SIZE]
-                            urls = [_pnr_to_url(c) for c in chunk]
-                            html_map = _fetch_batch(urls)
+                                for c_pnr in chunk:
+                                    url = _pnr_to_url(c_pnr)
+                                    html = html_map.get(url)
+                                    if not html:
+                                        continue
+                                    person_data = _parse_brukare(html, c_pnr)
+                                    if not person_data:
+                                        continue
+                                    found_parts = set(person_data["namn"].lower().split())
+                                    if target_parts & found_parts:
+                                        person_data.update(enrich_fields)
+                                        db.insert_people_batch([person_data])
+                                        resolved += 1
+                                        matched = True
+                                        log.info("Phase 2E: MATCHED '%s' → %s (attempt %d)",
+                                                 namn, c_pnr, i + chunk.index(c_pnr) + 1)
+                                        break
 
-                            for c_pnr in chunk:
-                                url = _pnr_to_url(c_pnr)
-                                html = html_map.get(url)
-                                if not html:
-                                    continue
-                                person_data = _parse_brukare(html, c_pnr)
-                                if not person_data:
-                                    continue
-                                found_parts = set(person_data["namn"].lower().split())
-                                if target_parts & found_parts:
-                                    person_data.update(enrich_fields)
-                                    db.insert_people_batch([person_data])
-                                    resolved += 1
-                                    matched = True
-                                    log.info("Phase 2E: MATCHED '%s' → %s (attempt %d)",
-                                             namn, c_pnr, i + chunk.index(c_pnr) + 1)
+                                if matched:
                                     break
 
-                            if matched:
-                                break
-
-                        if not matched:
-                            db.enrich_person(pnr, enrich_fields)
-                            log.info("Phase 2E: no biluppgifter match for '%s' (tested %d candidates)",
-                                     namn, len(candidates))
+                            if not matched:
+                                db.enrich_person(pnr, enrich_fields)
+                                log.info("Phase 2E: no biluppgifter match for '%s' (tested %d candidates)",
+                                         namn, len(candidates))
 
                         now_iso = datetime.now().isoformat(timespec="seconds")
                         db.update_job_state(
@@ -780,7 +817,10 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                         await asyncio.sleep(eniro_helper._jitter(1.0))
 
             finally:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     try:
         asyncio.run(_eniro_loop())
