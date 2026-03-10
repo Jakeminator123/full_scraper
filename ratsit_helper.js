@@ -1,13 +1,16 @@
 /**
- * ratsit_helper.js — Ratsit date-harvesting bridge for Phase 0
+ * ratsit_helper.js — Ratsit bridge for Phase 0 and Phase 3
  *
- * Returns ALL available fields per person, including data that requires
- * visiting the profile page (PNR, phone, grannar).
+ * Mode 1 — date harvesting (Phase 0):
+ *   Input:  { "date": "YYYY-MM-DD", "gender": "m"|"f" }
+ *   Output: [{ pnr, name, givenName, age, ... phone, neighbours }, ...]
  *
- * Output JSON per person:
- *   { pnr, name, givenName, age, streetAddress, city, gender,
- *     married, hasCorporateEngagements, lat, lng,
- *     phone, vehiclesOnAddress, neighbours }
+ * Mode 2 — enrich existing people (Phase 3):
+ *   Input:  { "mode": "enrich", "people": [{ "pnr": "...", "namn": "...", "stad": "..." }, ...] }
+ *   Output: [{ pnr, gender, married, hasCorporateEngagements, lat, lng,
+ *              givenName, phone, neighbours }, ...]
+ *   Searches "namn PNR-datum" on Ratsit → 1 hit → profile visit → extra fields.
+ *   Much faster than date-harvesting: 1 search + 1 profile per person.
  */
 
 const { chromium } = require("playwright");
@@ -195,6 +198,62 @@ async function resolveProfile(page, profileUrl) {
   };
 }
 
+// ─── enrich: search "name PNR-date" → 1 hit → profile ──────────────────────
+
+function buildEnrichSearchUrl(query) {
+  const params = new URLSearchParams({
+    vem: query,
+    m: "0", k: "0",
+    r: "0", er: "0", b: "0", eb: "0",
+    amin: "16", amax: "120", fon: "0",
+    page: "1",
+  });
+  return `https://www.ratsit.se/sok/person?${params}`;
+}
+
+async function enrichOne(page, pnr, namn, stad) {
+  const dateStr = pnr.replace("-", "").substring(0, 8);
+  const query = `${namn} ${dateStr}`;
+  const searchUrl = buildEnrichSearchUrl(query);
+
+  let searchData = null;
+  const searchHandler = async (resp) => {
+    if (resp.url().includes("/api/search/combined")) {
+      try { searchData = await resp.json(); } catch {}
+    }
+  };
+  page.on("response", searchHandler);
+  try {
+    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await dismissCookies(page);
+    await sleep(jitter(1500));
+  } catch (e) {
+    page.off("response", searchHandler);
+    return null;
+  }
+  page.off("response", searchHandler);
+
+  if (!searchData?.person?.hits?.length) return null;
+
+  const hit = searchData.person.hits.find((h) => !h.hidden) || searchData.person.hits[0];
+  if (!hit?.personUrl) return null;
+
+  await sleep(jitter(PHASE0_PAUSE_MS));
+  const profile = await resolveProfile(page, hit.personUrl);
+
+  return {
+    pnr,
+    gender: hit.gender || "",
+    married: hit.married ?? null,
+    hasCorporateEngagements: hit.hasCorporateEngagements ?? null,
+    givenName: hit.givenName || "",
+    lat: hit.coordinates?.lat || "",
+    lng: hit.coordinates?.lng || "",
+    phone: profile.phone,
+    neighbours: profile.neighbours,
+  };
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 (async () => {
@@ -214,13 +273,6 @@ async function resolveProfile(page, profileUrl) {
     process.exit(1);
   }
 
-  const { date: dateStr, gender } = input;
-  if (!dateStr || !gender) {
-    process.stderr.write('Missing required fields: "date" and "gender"\n');
-    process.stdout.write("[]");
-    process.exit(1);
-  }
-
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
     userAgent: pickRandom(USER_AGENTS),
@@ -228,13 +280,46 @@ async function resolveProfile(page, profileUrl) {
     extraHTTPHeaders: { "Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8" },
   });
   const page = await ctx.newPage();
-
   for (const pattern of BLOCK_PATTERNS) {
     await page.route(pattern, (route) => route.abort());
   }
 
-  const results = [];
+  // ── Mode: enrich ────────────────────────────────────────────────────────
+  if (input.mode === "enrich") {
+    const people = input.people || [];
+    const results = [];
+    try {
+      for (let i = 0; i < people.length; i++) {
+        const p = people[i];
+        if (!p.pnr || !p.namn) continue;
+        process.stderr.write(`  enrich ${i + 1}/${people.length}: ${p.namn}\n`);
+        try {
+          const enriched = await enrichOne(page, p.pnr, p.namn, p.stad || "");
+          if (enriched) results.push(enriched);
+        } catch (e) {
+          process.stderr.write(`  ERR ${p.pnr}: ${e.message}\n`);
+        }
+        if (i < people.length - 1) await sleep(jitter(PHASE0_PAUSE_MS));
+      }
+    } catch (e) {
+      process.stderr.write(`Fatal: ${e.message}\n`);
+    } finally {
+      await browser.close();
+    }
+    process.stdout.write(JSON.stringify(results));
+    return;
+  }
 
+  // ── Mode: date harvesting (default) ─────────────────────────────────────
+  const { date: dateStr, gender } = input;
+  if (!dateStr || !gender) {
+    process.stderr.write('Missing required fields: "date" and "gender"\n');
+    process.stdout.write("[]");
+    await browser.close();
+    process.exit(1);
+  }
+
+  const results = [];
   try {
     const rawHits = await searchRatsit(page, dateStr, gender);
     process.stderr.write(
@@ -282,7 +367,7 @@ async function resolveProfile(page, profileUrl) {
 
     process.stderr.write(
       `${dateStr} gender=${gender}: ${results.length} PNRs resolved, ` +
-      `${results.filter(r => r.phone).length} phones\n`
+        `${results.filter((r) => r.phone).length} phones\n`
     );
   } catch (e) {
     process.stderr.write(`Fatal error: ${e.message}\n`);

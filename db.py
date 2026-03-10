@@ -114,6 +114,9 @@ def init_db() -> None:
         "ALTER TABLE job_state ADD COLUMN speed_tested_per_hour REAL DEFAULT 0",
         # Enrichment counters (added in v5)
         "ALTER TABLE job_state ADD COLUMN phase0_phones INTEGER DEFAULT 0",
+        # Phase 3: enrichment pass (added in v6)
+        "ALTER TABLE job_state ADD COLUMN phase3_enriched INTEGER DEFAULT 0",
+        "ALTER TABLE job_state ADD COLUMN phase3_phones INTEGER DEFAULT 0",
         # People-table enrichment columns (added in v5)
         "ALTER TABLE people ADD COLUMN kon TEXT DEFAULT ''",
         "ALTER TABLE people ADD COLUMN gift INTEGER DEFAULT -1",
@@ -231,17 +234,32 @@ def update_status_snapshot(total_people: int, total_tested: int) -> dict[str, fl
 
 # ── people ─────────────────────────────────────────────────────────────────────
 
+_ENRICHMENT_COLS = ("kon", "gift", "tilltalsnamn", "postnummer", "lat", "lng",
+                    "bolag", "telefon", "grannar", "kalla")
+
 _PEOPLE_COLS = (
     "pnr", "namn", "alder", "stad", "gata",
     "har_fordon", "antal_fordon_egna", "fordon_egna_regnr", "fordon_egna_modell",
     "antal_fordon_adress", "fordon_adress_regnr", "hamtad",
-    "kon", "gift", "tilltalsnamn", "postnummer", "lat", "lng",
-    "bolag", "telefon", "grannar", "kalla",
+    *_ENRICHMENT_COLS,
 )
 _PEOPLE_PLACEHOLDERS = ",".join("?" * len(_PEOPLE_COLS))
-_PEOPLE_INSERT_SQL = (
-    f"INSERT OR IGNORE INTO people ({','.join(_PEOPLE_COLS)}) "
-    f"VALUES ({_PEOPLE_PLACEHOLDERS})"
+
+# Upsert: insert new rows, but if PNR exists merge enrichment fields.
+# Only overwrites an enrichment column when the NEW value is non-empty/non-default
+# AND the existing value IS empty/default — never clobbers good data.
+_UPSERT_SET_PARTS = []
+for _c in _ENRICHMENT_COLS:
+    if _c in ("gift", "bolag", "grannar"):
+        _UPSERT_SET_PARTS.append(f"{_c}=CASE WHEN {_c}<0 AND excluded.{_c}>=0 THEN excluded.{_c} ELSE {_c} END")
+    else:
+        _UPSERT_SET_PARTS.append(f"{_c}=CASE WHEN {_c}='' AND excluded.{_c}!='' THEN excluded.{_c} ELSE {_c} END")
+_UPSERT_TAIL = ", ".join(_UPSERT_SET_PARTS)
+
+_PEOPLE_UPSERT_SQL = (
+    f"INSERT INTO people ({','.join(_PEOPLE_COLS)}) "
+    f"VALUES ({_PEOPLE_PLACEHOLDERS}) "
+    f"ON CONFLICT(pnr) DO UPDATE SET {_UPSERT_TAIL}"
 )
 
 
@@ -265,7 +283,7 @@ def _person_row(p: dict) -> tuple:
 
 def insert_person(p: dict) -> bool:
     try:
-        _conn().execute(_PEOPLE_INSERT_SQL, _person_row(p))
+        _conn().execute(_PEOPLE_UPSERT_SQL, _person_row(p))
         _conn().commit()
         return True
     except sqlite3.IntegrityError:
@@ -280,7 +298,7 @@ def insert_people_batch(people: list[dict]) -> int:
     try:
         conn.execute("BEGIN")
         for p in people:
-            cur = conn.execute(_PEOPLE_INSERT_SQL, _person_row(p))
+            cur = conn.execute(_PEOPLE_UPSERT_SQL, _person_row(p))
             if cur.rowcount > 0:
                 inserted += 1
         conn.commit()
@@ -382,6 +400,92 @@ def existing_pnrs(pnr_list: list[str]) -> set[str]:
         f"SELECT pnr FROM people WHERE pnr IN ({placeholders})", pnr_list
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def enrich_person(pnr: str, fields: dict) -> bool:
+    """Update enrichment columns for a person, only filling blanks."""
+    sets, vals = [], []
+    for col in _ENRICHMENT_COLS:
+        new_val = fields.get(col)
+        if new_val is None:
+            continue
+        if col in ("gift", "bolag", "grannar"):
+            if isinstance(new_val, bool):
+                new_val = int(new_val)
+            if not isinstance(new_val, int) or new_val < 0:
+                continue
+            sets.append(f"{col}=CASE WHEN {col}<0 THEN ? ELSE {col} END")
+        else:
+            new_val = str(new_val)
+            if not new_val:
+                continue
+            sets.append(f"{col}=CASE WHEN {col}='' THEN ? ELSE {col} END")
+        vals.append(new_val)
+
+    if not sets:
+        return False
+    vals.append(pnr)
+    sql = f"UPDATE people SET {', '.join(sets)} WHERE pnr=?"
+    cur = _conn().execute(sql, vals)
+    _conn().commit()
+    return cur.rowcount > 0
+
+
+def enrich_people_batch(batch: list[tuple[str, dict]]) -> int:
+    """Enrich multiple people. batch = [(pnr, fields_dict), ...]. Returns count updated."""
+    if not batch:
+        return 0
+    updated = 0
+    conn = _conn()
+    try:
+        conn.execute("BEGIN")
+        for pnr, fields in batch:
+            sets, vals = [], []
+            for col in _ENRICHMENT_COLS:
+                new_val = fields.get(col)
+                if new_val is None:
+                    continue
+                if col in ("gift", "bolag", "grannar"):
+                    if isinstance(new_val, bool):
+                        new_val = int(new_val)
+                    if not isinstance(new_val, int) or new_val < 0:
+                        continue
+                    sets.append(f"{col}=CASE WHEN {col}<0 THEN ? ELSE {col} END")
+                else:
+                    new_val = str(new_val)
+                    if not new_val:
+                        continue
+                    sets.append(f"{col}=CASE WHEN {col}='' THEN ? ELSE {col} END")
+                vals.append(new_val)
+            if not sets:
+                continue
+            vals.append(pnr)
+            cur = conn.execute(f"UPDATE people SET {', '.join(sets)} WHERE pnr=?", vals)
+            if cur.rowcount > 0:
+                updated += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return updated
+
+
+def get_unenriched_pnrs(limit: int = 50) -> list[dict]:
+    """Return people that lack Ratsit enrichment data, ordered oldest first."""
+    rows = _conn().execute(
+        """SELECT pnr, namn, alder, stad FROM people
+           WHERE kalla NOT LIKE '%ratsit%' AND namn != ''
+           ORDER BY rowid ASC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_unenriched() -> int:
+    row = _conn().execute(
+        "SELECT COUNT(*) FROM people WHERE kalla NOT LIKE '%ratsit%' AND namn != ''"
+    ).fetchone()
+    return row[0] if row else 0
 
 
 def iter_all_people() -> Generator[dict, None, None]:

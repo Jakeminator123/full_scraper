@@ -734,22 +734,128 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main run loop (both phases)
+#  Phase 3: Ratsit enrichment of existing people (fast — ~2s per person)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ENRICH_BATCH_SIZE = int(os.environ.get("ENRICH_BATCH_SIZE", "10"))
+
+
+def _ratsit_enrich_batch(people: list[dict]) -> list[dict]:
+    """Call ratsit_helper.js in enrich mode. Returns list of enriched dicts."""
+    payload = json.dumps({"mode": "enrich", "people": people})
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ["node", RATSIT_JS, "--stdin"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=APP_DIR,
+            env={**os.environ, "PHASE0_PAUSE": str(PHASE0_PAUSE)},
+        )
+        timeout_sec = int(PHASE0_PAUSE * len(people) * 10 + 120)
+        stdout, stderr = proc.communicate(input=payload, timeout=timeout_sec)
+        if stderr:
+            log.info("Phase 3 ratsit_helper: %s", stderr.strip()[:300])
+        if proc.returncode != 0:
+            log.warning("Phase 3 ratsit_helper error (exit %d)", proc.returncode)
+            return []
+        result = json.loads(stdout)
+        return result if isinstance(result, list) else []
+    except subprocess.TimeoutExpired:
+        log.warning("Phase 3 ratsit_helper timeout — killing")
+        if proc:
+            proc.kill()
+            proc.wait()
+        return []
+    except Exception as e:
+        log.error("Phase 3 ratsit_helper exception: %s", e)
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        return []
+
+
+def _run_phase3() -> None:
+    """Enrich existing people that lack Ratsit data (kön, GPS, telefon, etc.)."""
+    state = db.get_job_state()
+    enriched = state.get("phase3_enriched", 0)
+    phones = state.get("phase3_phones", 0)
+
+    remaining = db.count_unenriched()
+    log.info("Phase 3: Ratsit enrichment. %d unenriched, %d already enriched",
+             remaining, enriched)
+
+    if remaining == 0:
+        log.info("Phase 3: nothing to enrich")
+        return
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    db.update_job_state(phase="phase3", updated_at=now_iso, last_progress_at=now_iso)
+
+    while not _stop_event.is_set():
+        batch = db.get_unenriched_pnrs(ENRICH_BATCH_SIZE)
+        if not batch:
+            break
+
+        results = _ratsit_enrich_batch(batch)
+        if not results:
+            log.info("Phase 3: batch returned 0 results, continuing")
+            continue
+
+        enrich_pairs = []
+        batch_phones = 0
+        for r in results:
+            pnr = r.get("pnr")
+            if not pnr:
+                continue
+            fields = {
+                "kon": r.get("gender", ""),
+                "tilltalsnamn": r.get("givenName", ""),
+                "lat": str(r.get("lat", "")),
+                "lng": str(r.get("lng", "")),
+                "telefon": r.get("phone", ""),
+                "grannar": r.get("neighbours", -1),
+                "kalla": "ratsit+biluppgifter",
+            }
+            married = r.get("married")
+            fields["gift"] = int(married) if isinstance(married, bool) else -1
+            bolag = r.get("hasCorporateEngagements")
+            fields["bolag"] = int(bolag) if isinstance(bolag, bool) else -1
+
+            enrich_pairs.append((pnr, fields))
+            if r.get("phone"):
+                batch_phones += 1
+
+        updated = db.enrich_people_batch(enrich_pairs)
+        enriched += updated
+        phones += batch_phones
+
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        db.update_job_state(
+            phase3_enriched=enriched,
+            phase3_phones=phones,
+            updated_at=now_iso,
+            last_progress_at=now_iso,
+        )
+        log.info("Phase 3: enriched +%d (%d phones), total %d enriched",
+                 updated, batch_phones, enriched)
+
+    log.info("Phase 3 done/paused: %d enriched, %d phones", enriched, phones)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main run loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run(start_year: int, end_year: int, target: int,
          skip_phase1: bool = False, skip_phase0: bool = False) -> None:
-    """Run scraping phases SEQUENTIALLY to stay within 4 GB RAM.
+    """Run scraping phases to stay within 4 GB RAM.
 
-    Old design ran all phases in parallel, but each phase launches its own
-    Chromium instances (~200 MB each).  With Phase 0 now doing profile visits,
-    running everything at once exceeds the 4 GB memory limit and OOM-kills
-    the container every ~20 minutes.
-
-    New order:
-      1. Phase 0 (Ratsit) — runs alone, 1 Chromium, ~400 MB
-      2. Phase 1 (vehicles) — runs in background during Phase 2
+    Order:
+      1. Phase 0 (Ratsit date-harvest) — runs alone, 1 Chromium
+      2. Phase 1 (vehicles) — background during Phase 2
       3. Phase 2 (PNR brute-force) — main workload
+      4. Phase 3 (Ratsit enrichment) — background during Phase 2,
+         enriches people found by Phase 2 with kön/GPS/telefon
     """
     try:
         state = db.get_job_state()
@@ -775,6 +881,13 @@ def _run(start_year: int, end_year: int, target: int,
             phase1_thread.start()
             bg_threads.append(phase1_thread)
             log.info("Phase 1 started in background thread")
+
+        # Phase 3: enrichment in background (1 Chromium, conservative rate)
+        phase3_thread = threading.Thread(
+            target=_run_phase3, daemon=True, name="phase3")
+        phase3_thread.start()
+        bg_threads.append(phase3_thread)
+        log.info("Phase 3 (enrichment) started in background thread")
 
         # Phase 2 runs in main thread
         if not _stop_event.is_set():
@@ -930,6 +1043,10 @@ def get_status() -> dict:
         "phase0_days_done":     p0_days_done,
         "phase0_days_total":    total_days,
         "phase0_phones":        state.get("phase0_phones", 0),
+        # Phase 3 (enrichment)
+        "phase3_enriched":      state.get("phase3_enriched", 0),
+        "phase3_phones":        state.get("phase3_phones", 0),
+        "phase3_unenriched":    db.count_unenriched(),
         # Phase 1
         "phase1_prefixes_done": p1_prefixes,
         "phase1_prefixes_total": TOTAL_PREFIXES,

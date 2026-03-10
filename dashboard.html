@@ -111,7 +111,7 @@
 <div class="warn-box" id="heartbeat-warning"></div>
 
 <!-- Row 1: Key metrics -->
-<div class="grid">
+<div class="grid" style="grid-template-columns:1fr 1fr">
   <div class="card">
     <h3>Personer i databasen</h3>
     <div class="big text-green" id="m-people">—</div>
@@ -121,16 +121,10 @@
     <h3>Fordon i databasen</h3>
     <div class="big" style="color:var(--cyan)" id="m-vehicles">—</div>
   </div>
-  <div class="card">
-    <h3>Databasstorlek</h3>
-    <div class="big" id="m-dbsize">—</div>
-    <div class="sub" id="m-eta"></div>
-    <div class="sub" id="m-uptime"></div>
-  </div>
 </div>
 
 <!-- Row 2: Phase progress -->
-<div class="grid">
+<div class="grid" style="grid-template-columns:1fr 1fr">
   <div class="card">
     <h3>Fas 0 — Ratsit Harvesting</h3>
     <div class="flex-between">
@@ -140,6 +134,17 @@
     <div class="bar-track"><div class="bar-fill bar-accent" id="p0-bar" style="width:0%"></div></div>
     <div class="sub" id="p0-pct" style="margin-top:4px"></div>
   </div>
+  <div class="card">
+    <h3>Fas 3 — Ratsit Enrichment</h3>
+    <div class="flex-between">
+      <span class="big" style="color:#f97316;font-size:24px" id="p3-enriched">—</span>
+      <span class="sub" id="p3-remaining"></span>
+    </div>
+    <div class="bar-track"><div class="bar-fill" id="p3-bar" style="width:0%;background:linear-gradient(90deg,#f97316,var(--yellow))"></div></div>
+    <div class="sub" id="p3-detail" style="margin-top:4px"></div>
+  </div>
+</div>
+<div class="grid" style="grid-template-columns:1fr 1fr 1fr">
   <div class="card">
     <h3>Fas 1 — Fordon</h3>
     <div class="flex-between">
@@ -157,6 +162,12 @@
     </div>
     <div class="bar-track"><div class="bar-fill bar-green" id="p2-bar" style="width:0%"></div></div>
     <div class="sub" id="p2-detail" style="margin-top:4px"></div>
+  </div>
+  <div class="card">
+    <h3>Databasstorlek</h3>
+    <div class="big" id="m-dbsize">—</div>
+    <div class="sub" id="m-eta"></div>
+    <div class="sub" id="m-uptime"></div>
   </div>
 </div>
 
@@ -183,6 +194,7 @@
       <button class="btn btn-primary" id="btn-start" onclick="doStart()">Starta jobb</button>
       <button class="btn" id="btn-stop" onclick="doStop()">Pausa</button>
       <button class="btn btn-danger" onclick="doReset()">Reset DB</button>
+      <button class="btn" onclick="window.open('/diag','_blank')" style="border-color:var(--cyan);color:var(--cyan)">Diagnostik</button>
     </div>
     <h3 style="margin-top:16px">Ladda ned databasen</h3>
     <div class="actions">
@@ -365,6 +377,17 @@ async function updateStatus() {
     document.getElementById("p2-bar").style.width = (s.phase2_pct_done || 0) + "%";
     document.getElementById("p2-detail").textContent =
       `${s.phase2_pct_done||0}% · testat ${fmt(s.total_tested||0)} · hit ${s.hit_rate_pct||0}% · err ${fmt(s.total_errors||0)}`;
+
+    // Phase 3
+    const p3enriched = s.phase3_enriched || 0;
+    const p3unenriched = s.phase3_unenriched || 0;
+    const p3total = p3enriched + p3unenriched;
+    const p3pct = p3total > 0 ? Math.min(100, (p3enriched / p3total) * 100) : 0;
+    document.getElementById("p3-enriched").textContent = fmt(p3enriched);
+    document.getElementById("p3-remaining").textContent = `${fmt(p3unenriched)} kvar`;
+    document.getElementById("p3-bar").style.width = p3pct.toFixed(1) + "%";
+    document.getElementById("p3-detail").textContent =
+      `${p3pct.toFixed(1)}% · ${fmt(s.phase3_phones || 0)} telefonnr`;
 
     // Enrichment bars
     const e = s.enrichment || {};
