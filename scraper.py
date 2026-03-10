@@ -571,7 +571,7 @@ def _run_phase1() -> None:
             for p in range(page_num, page_num + PARALLEL_WORKERS):
                 urls.append(_prefix_page_url(prefix, p))
 
-            html_map = _fetch_parallel(urls, workers=len(urls))
+            html_map = _fetch_parallel(urls, workers=min(len(urls), 2))
 
             any_results = False
             batch_vehicles = []
@@ -1003,62 +1003,80 @@ def _run_phase3() -> None:
 
 def _run(start_year: int, end_year: int, target: int,
          skip_phase1: bool = False, skip_phase0: bool = False) -> None:
-    """Run scraping phases SEQUENTIALLY to stay within 4 GB RAM.
+    """Run scraping phases with smart parallelism within 4 GB RAM.
 
-    Order:
-      1. Phase 0 (Ratsit date-harvest) — alone, 1 Chromium
-      2. Phase 1 (vehicles) — background during Phase 2
-      3. Phase 2 (PNR brute-force) — main workload, full CPU
-      4. Phase 3 (Ratsit enrichment) — AFTER Phase 2, alone
+    Stage 1 — parallel harvest (~1.5 GB total):
+      Phase 0  (Ratsit date-harvest, 1 Chromium, ~400 MB)
+      Phase 1  (vehicle prefixes, 2 Chromium, ~400 MB)
+      Phase 2E (Eniro PNR resolver, 1 Chromium, ~400 MB)
+
+    Stage 2 — full-power brute-force (~2.5 GB):
+      Phase 2  (PNR enumeration, 8 workers, gets all remaining RAM)
+
+    Stage 3 — enrichment:
+      Phase 3  (Ratsit enrichment, 1 Chromium, after Phase 2)
     """
     try:
         state = db.get_job_state()
         phase = state.get("phase", "")
+        bg_threads: list[threading.Thread] = []
 
-        # Phase 0: Ratsit harvesting — runs FIRST, alone
+        # ── Stage 1: parallel harvest ────────────────────────────────────
         phase0_needed = (
             not skip_phase0
             and phase not in ("phase0_done",)
         )
-        if phase0_needed and not _stop_event.is_set():
-            log.info("Phase 0 (Ratsit harvesting) starting — runs alone to save RAM")
-            _run_phase0(start_year, end_year)
-            if _stop_event.is_set():
-                return
-
-        # Phase 1: vehicle prefix enumeration in background (low memory)
-        bg_threads: list[threading.Thread] = []
         phase1_needed = (not skip_phase1 and phase not in ("phase1_done",))
+        phase2e_needed = db.count_unenriched() > 0
+
+        if phase0_needed and not _stop_event.is_set():
+            phase0_thread = threading.Thread(
+                target=_run_phase0, args=(start_year, end_year),
+                daemon=True, name="phase0")
+            phase0_thread.start()
+            bg_threads.append(phase0_thread)
+            log.info("Phase 0 (Ratsit) started in background")
+
         if phase1_needed and not _stop_event.is_set():
             phase1_thread = threading.Thread(
                 target=_run_phase1, daemon=True, name="phase1")
             phase1_thread.start()
             bg_threads.append(phase1_thread)
-            log.info("Phase 1 started in background thread")
+            log.info("Phase 1 (vehicles) started in background")
 
-        # Phase 2E: Eniro-guided PNR resolution (before blind brute-force)
-        if not _stop_event.is_set() and db.count_unenriched() > 0:
-            log.info("Phase 2E (Eniro-guided) starting — resolves PNR via birthDate")
-            _run_phase2e(start_year, end_year)
-            if _stop_event.is_set():
-                for t in bg_threads:
-                    if t.is_alive():
-                        t.join(timeout=10)
-                return
+        if phase2e_needed and not _stop_event.is_set():
+            phase2e_thread = threading.Thread(
+                target=_run_phase2e, args=(start_year, end_year),
+                daemon=True, name="phase2e")
+            phase2e_thread.start()
+            bg_threads.append(phase2e_thread)
+            log.info("Phase 2E (Eniro) started in background")
 
-        # Phase 2 runs in main thread — gets full CPU/RAM
-        if not _stop_event.is_set():
-            _run_phase2(start_year, end_year, target)
-
-        # Wait for background threads
+        # Wait for Stage 1 to finish (Phase 0, 1, 2E all complete)
         for t in bg_threads:
             if t.is_alive():
                 log.info("Waiting for %s to finish...", t.name)
                 t.join()
+        bg_threads.clear()
 
-        # Phase 3: enrichment — runs AFTER Phase 2, alone
+        if _stop_event.is_set():
+            return
+
+        # ── Stage 2: full-power Phase 2 (gets all RAM) ──────────────────
+        global PARALLEL_WORKERS
+        original_workers = PARALLEL_WORKERS
+        PARALLEL_WORKERS = max(original_workers, 8)
+        log.info("Phase 2 starting with %d workers (boosted from %d)",
+                 PARALLEL_WORKERS, original_workers)
+
+        if not _stop_event.is_set():
+            _run_phase2(start_year, end_year, target)
+
+        PARALLEL_WORKERS = original_workers
+
+        # ── Stage 3: enrichment ──────────────────────────────────────────
         if not _stop_event.is_set() and db.count_unenriched() > 0:
-            log.info("Phase 3 (Ratsit enrichment) starting — runs alone after Phase 2")
+            log.info("Phase 3 (Ratsit enrichment) starting after Phase 2")
             _run_phase3()
 
     except Exception as e:
