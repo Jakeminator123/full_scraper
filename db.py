@@ -46,7 +46,17 @@ def init_db() -> None:
             fordon_egna_modell  TEXT    DEFAULT '',
             antal_fordon_adress INTEGER DEFAULT 0,
             fordon_adress_regnr TEXT    DEFAULT '',
-            hamtad              TEXT    DEFAULT ''
+            hamtad              TEXT    DEFAULT '',
+            kon                 TEXT    DEFAULT '',
+            gift                INTEGER DEFAULT -1,
+            tilltalsnamn        TEXT    DEFAULT '',
+            postnummer          TEXT    DEFAULT '',
+            lat                 TEXT    DEFAULT '',
+            lng                 TEXT    DEFAULT '',
+            bolag               INTEGER DEFAULT -1,
+            telefon             TEXT    DEFAULT '',
+            grannar             INTEGER DEFAULT -1,
+            kalla               TEXT    DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS vehicles (
@@ -102,6 +112,19 @@ def init_db() -> None:
         "ALTER TABLE job_state ADD COLUMN status_snapshot_tested INTEGER DEFAULT 0",
         "ALTER TABLE job_state ADD COLUMN speed_people_per_hour REAL DEFAULT 0",
         "ALTER TABLE job_state ADD COLUMN speed_tested_per_hour REAL DEFAULT 0",
+        # Enrichment counters (added in v5)
+        "ALTER TABLE job_state ADD COLUMN phase0_phones INTEGER DEFAULT 0",
+        # People-table enrichment columns (added in v5)
+        "ALTER TABLE people ADD COLUMN kon TEXT DEFAULT ''",
+        "ALTER TABLE people ADD COLUMN gift INTEGER DEFAULT -1",
+        "ALTER TABLE people ADD COLUMN tilltalsnamn TEXT DEFAULT ''",
+        "ALTER TABLE people ADD COLUMN postnummer TEXT DEFAULT ''",
+        "ALTER TABLE people ADD COLUMN lat TEXT DEFAULT ''",
+        "ALTER TABLE people ADD COLUMN lng TEXT DEFAULT ''",
+        "ALTER TABLE people ADD COLUMN bolag INTEGER DEFAULT -1",
+        "ALTER TABLE people ADD COLUMN telefon TEXT DEFAULT ''",
+        "ALTER TABLE people ADD COLUMN grannar INTEGER DEFAULT -1",
+        "ALTER TABLE people ADD COLUMN kalla TEXT DEFAULT ''",
     ]
     for sql in migrations:
         try:
@@ -208,24 +231,41 @@ def update_status_snapshot(total_people: int, total_tested: int) -> dict[str, fl
 
 # ── people ─────────────────────────────────────────────────────────────────────
 
+_PEOPLE_COLS = (
+    "pnr", "namn", "alder", "stad", "gata",
+    "har_fordon", "antal_fordon_egna", "fordon_egna_regnr", "fordon_egna_modell",
+    "antal_fordon_adress", "fordon_adress_regnr", "hamtad",
+    "kon", "gift", "tilltalsnamn", "postnummer", "lat", "lng",
+    "bolag", "telefon", "grannar", "kalla",
+)
+_PEOPLE_PLACEHOLDERS = ",".join("?" * len(_PEOPLE_COLS))
+_PEOPLE_INSERT_SQL = (
+    f"INSERT OR IGNORE INTO people ({','.join(_PEOPLE_COLS)}) "
+    f"VALUES ({_PEOPLE_PLACEHOLDERS})"
+)
+
+
+def _person_row(p: dict) -> tuple:
+    return (
+        p["pnr"], p.get("namn", ""), p.get("alder", 0),
+        p.get("stad", ""), p.get("gata", ""),
+        1 if p.get("har_fordon") else 0,
+        p.get("antal_fordon_egna", 0), p.get("fordon_egna_regnr", ""),
+        p.get("fordon_egna_modell", ""),
+        p.get("antal_fordon_adress", 0), p.get("fordon_adress_regnr", ""),
+        p.get("hamtad", ""),
+        p.get("kon", ""), int(p["gift"]) if isinstance(p.get("gift"), bool) else int(p.get("gift", -1)),
+        p.get("tilltalsnamn", ""), p.get("postnummer", ""),
+        p.get("lat", ""), p.get("lng", ""),
+        int(p["bolag"]) if isinstance(p.get("bolag"), bool) else int(p.get("bolag", -1)),
+        p.get("telefon", ""), p.get("grannar", -1),
+        p.get("kalla", ""),
+    )
+
+
 def insert_person(p: dict) -> bool:
     try:
-        _conn().execute(
-            """INSERT OR IGNORE INTO people
-               (pnr, namn, alder, stad, gata,
-                har_fordon, antal_fordon_egna, fordon_egna_regnr, fordon_egna_modell,
-                antal_fordon_adress, fordon_adress_regnr, hamtad)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                p["pnr"], p.get("namn",""), p.get("alder",0),
-                p.get("stad",""), p.get("gata",""),
-                1 if p.get("har_fordon") else 0,
-                p.get("antal_fordon_egna",0), p.get("fordon_egna_regnr",""),
-                p.get("fordon_egna_modell",""),
-                p.get("antal_fordon_adress",0), p.get("fordon_adress_regnr",""),
-                p.get("hamtad",""),
-            ),
-        )
+        _conn().execute(_PEOPLE_INSERT_SQL, _person_row(p))
         _conn().commit()
         return True
     except sqlite3.IntegrityError:
@@ -233,7 +273,6 @@ def insert_person(p: dict) -> bool:
 
 
 def insert_people_batch(people: list[dict]) -> int:
-    """Insert multiple people in a single transaction. Returns count of new inserts."""
     if not people:
         return 0
     conn = _conn()
@@ -241,22 +280,7 @@ def insert_people_batch(people: list[dict]) -> int:
     try:
         conn.execute("BEGIN")
         for p in people:
-            cur = conn.execute(
-                """INSERT OR IGNORE INTO people
-                   (pnr, namn, alder, stad, gata,
-                    har_fordon, antal_fordon_egna, fordon_egna_regnr, fordon_egna_modell,
-                    antal_fordon_adress, fordon_adress_regnr, hamtad)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    p["pnr"], p.get("namn",""), p.get("alder",0),
-                    p.get("stad",""), p.get("gata",""),
-                    1 if p.get("har_fordon") else 0,
-                    p.get("antal_fordon_egna",0), p.get("fordon_egna_regnr",""),
-                    p.get("fordon_egna_modell",""),
-                    p.get("antal_fordon_adress",0), p.get("fordon_adress_regnr",""),
-                    p.get("hamtad",""),
-                ),
-            )
+            cur = conn.execute(_PEOPLE_INSERT_SQL, _person_row(p))
             if cur.rowcount > 0:
                 inserted += 1
         conn.commit()
@@ -303,6 +327,26 @@ def count_people(har_fordon: int | None = None) -> int:
             "SELECT COUNT(*) FROM people WHERE har_fordon=?", (har_fordon,)
         ).fetchone()
     return row[0] if row else 0
+
+
+def count_enrichment() -> dict:
+    """Return counts of people with enriched fields (non-default values)."""
+    conn = _conn()
+    rows = conn.execute("""
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN telefon != '' THEN 1 ELSE 0 END) AS med_telefon,
+            SUM(CASE WHEN kon != '' THEN 1 ELSE 0 END) AS med_kon,
+            SUM(CASE WHEN gift >= 0 THEN 1 ELSE 0 END) AS med_gift,
+            SUM(CASE WHEN lat != '' THEN 1 ELSE 0 END) AS med_gps,
+            SUM(CASE WHEN bolag >= 0 THEN 1 ELSE 0 END) AS med_bolag,
+            SUM(CASE WHEN tilltalsnamn != '' THEN 1 ELSE 0 END) AS med_tilltalsnamn,
+            SUM(CASE WHEN grannar >= 0 THEN 1 ELSE 0 END) AS med_grannar,
+            SUM(CASE WHEN kalla LIKE '%ratsit%' THEN 1 ELSE 0 END) AS fran_ratsit,
+            SUM(CASE WHEN kalla LIKE '%biluppgifter%' THEN 1 ELSE 0 END) AS fran_biluppgifter
+        FROM people
+    """).fetchone()
+    return dict(rows) if rows else {}
 
 
 def get_people(

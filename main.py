@@ -110,6 +110,19 @@ def status(_: Auth) -> dict:
     s["people_without_vehicles"] = db.count_people(har_fordon=0)
     s["total_vehicles_in_db"]    = db.count_vehicles()
 
+    enrichment = db.count_enrichment()
+    s["enrichment"] = {
+        "med_telefon":      enrichment.get("med_telefon", 0),
+        "med_kon":          enrichment.get("med_kon", 0),
+        "med_gift":         enrichment.get("med_gift", 0),
+        "med_gps":          enrichment.get("med_gps", 0),
+        "med_bolag":        enrichment.get("med_bolag", 0),
+        "med_tilltalsnamn": enrichment.get("med_tilltalsnamn", 0),
+        "med_grannar":      enrichment.get("med_grannar", 0),
+        "fran_ratsit":      enrichment.get("fran_ratsit", 0),
+        "fran_biluppgifter": enrichment.get("fran_biluppgifter", 0),
+    }
+
     # Rolling speed metrics are persisted so ETA survives container redeploys.
     snap = db.update_status_snapshot(total_people, int(s.get("total_tested", 0)))
     s["speed_people_per_hour"] = float(snap.get("speed_people_per_hour", s.get("speed_people_per_hour", 0)) or 0)
@@ -200,6 +213,8 @@ def export_csv(_: Auth) -> StreamingResponse:
         "pnr", "namn", "alder", "stad", "gata",
         "har_fordon", "antal_fordon_egna", "fordon_egna_regnr", "fordon_egna_modell",
         "antal_fordon_adress", "fordon_adress_regnr", "hamtad",
+        "kon", "gift", "tilltalsnamn", "postnummer", "lat", "lng",
+        "bolag", "telefon", "grannar", "kalla",
     ]
 
     def generate():

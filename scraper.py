@@ -45,10 +45,10 @@ BASE             = "https://biluppgifter.se"
 APP_DIR          = os.path.dirname(os.path.abspath(__file__))
 FETCH_JS         = os.path.join(APP_DIR, "fetch_helper.js")
 RATSIT_JS        = os.path.join(APP_DIR, "ratsit_helper.js")
-PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.3"))
-PHASE0_PAUSE     = float(os.environ.get("PHASE0_PAUSE",     "1.0"))
-BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "30"))
-PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "6"))
+PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.5"))
+PHASE0_PAUSE     = float(os.environ.get("PHASE0_PAUSE",     "1.5"))
+BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "25"))
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "4"))
 START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
 END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
 TARGET_PEOPLE_DEFAULT = int(os.environ.get("TARGET_PEOPLE_DEFAULT", "10400000"))
@@ -300,6 +300,7 @@ def _parse_brukare(html: str | None, pnr: str) -> dict | None:
         "antal_fordon_adress": len(fordon_adress_regnr),
         "fordon_adress_regnr": "|".join(fordon_adress_regnr),
         "hamtad": datetime.now().isoformat(timespec="seconds"),
+        "kalla": "biluppgifter",
     }
 
 
@@ -407,17 +408,17 @@ def _ratsit_harvest(date_str: str, gender: str) -> list[dict]:
 
 def _run_phase0(start_year: int, end_year: int) -> None:
     """
-    Phase 0: Harvest PNRs from Ratsit by searching each birth date + gender.
-    For each resolved PNR, fetch biluppgifter.se/brukare/{b64}/ and store person.
-    ~1.4M people expected from 24,000 dates × 2 genders × 30 max hits/search.
+    Phase 0: Harvest people from Ratsit by searching each birth date + gender.
+    For each resolved person the ratsit_helper returns all search fields PLUS
+    PNR, phone, and grannar from the profile visit.  We then fetch the
+    biluppgifter brukare page for fordon data and merge everything into a
+    single rich person dict before inserting into the DB.
     """
     state       = db.get_job_state()
     resume_date = state.get("phase0_date", "")
     found       = state.get("phase0_found", 0)
+    phones      = state.get("phase0_phones", 0)
 
-    # Recovery for older checkpoints created before reverse-iteration phase0.
-    # Old runs could leave phase0_date at START_YEAR-01-01 with zero findings,
-    # which makes reverse iteration think there's nothing left to do.
     if resume_date and found == 0:
         try:
             resumed = date.fromisoformat(resume_date)
@@ -428,7 +429,7 @@ def _run_phase0(start_year: int, end_year: int) -> None:
                     resume_date,
                 )
                 resume_date = ""
-                db.update_job_state(phase0_date="", phase0_found=0)
+                db.update_job_state(phase0_date="", phase0_found=0, phase0_phones=0)
         except ValueError:
             pass
 
@@ -449,6 +450,7 @@ def _run_phase0(start_year: int, end_year: int) -> None:
         date_str = d.isoformat()
 
         date_new = 0
+        date_phones = 0
         for gender in ("m", "f"):
             if _stop_event.is_set():
                 db.update_job_state(status="paused", phase="phase0",
@@ -480,27 +482,48 @@ def _run_phase0(start_year: int, end_year: int) -> None:
                     if not html:
                         continue
                     person = _parse_brukare(html, h["pnr"])
-                    if person:
-                        new_people.append(person)
+                    if not person:
+                        continue
+
+                    person["kon"] = h.get("gender", "")
+                    person["tilltalsnamn"] = h.get("givenName", "")
+                    person["lat"] = str(h.get("lat", ""))
+                    person["lng"] = str(h.get("lng", ""))
+                    person["telefon"] = h.get("phone", "")
+                    person["grannar"] = h.get("neighbours", -1)
+                    person["kalla"] = "ratsit+biluppgifter"
+
+                    married = h.get("married")
+                    person["gift"] = int(married) if isinstance(married, bool) else -1
+
+                    bolag = h.get("hasCorporateEngagements")
+                    person["bolag"] = int(bolag) if isinstance(bolag, bool) else -1
+
+                    new_people.append(person)
+                    if h.get("phone"):
+                        date_phones += 1
 
                 batch_inserted = db.insert_people_batch(new_people)
                 found += batch_inserted
                 date_new += batch_inserted
 
+        phones += date_phones
         dates_processed += 1
         now_iso = datetime.now().isoformat(timespec="seconds")
         db.update_job_state(
             phase0_date=date_str,
             phase0_found=found,
+            phase0_phones=phones,
             updated_at=now_iso,
             last_progress_at=now_iso,
         )
-        log.info("Phase 0: %s done — +%d new, %d total found, %d dates done",
-                 date_str, date_new, found, dates_processed)
+        log.info("Phase 0: %s done — +%d new (+%d phones), %d total found, %d dates done",
+                 date_str, date_new, date_phones, found, dates_processed)
 
-    log.info("Phase 0 complete: %d dates, %d people found", dates_processed, found)
+    log.info("Phase 0 complete: %d dates, %d people found, %d phones", dates_processed, found, phones)
     now_iso = datetime.now().isoformat(timespec="seconds")
-    db.update_job_state(phase="phase0_done", phase0_found=found, updated_at=now_iso, last_progress_at=now_iso)
+    db.update_job_state(phase="phase0_done", phase0_found=found, phase0_phones=phones,
+                        updated_at=now_iso, last_progress_at=now_iso)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -897,6 +920,7 @@ def get_status() -> dict:
         "phase0_pct_done":      p0_pct,
         "phase0_days_done":     p0_days_done,
         "phase0_days_total":    total_days,
+        "phase0_phones":        state.get("phase0_phones", 0),
         # Phase 1
         "phase1_prefixes_done": p1_prefixes,
         "phase1_prefixes_total": TOTAL_PREFIXES,

@@ -1,38 +1,56 @@
 /**
  * ratsit_helper.js — Ratsit date-harvesting bridge for Phase 0
  *
- * Usage (from scraper.py via subprocess):
- *   echo '{"date":"1986-05-28","gender":"m"}' | node ratsit_helper.js --stdin
+ * Returns ALL available fields per person, including data that requires
+ * visiting the profile page (PNR, phone, grannar).
  *
- * Input JSON:
- *   { "date": "YYYY-MM-DD", "gender": "m" | "f" }
- *
- * Output JSON (stdout):
- *   [{ "pnr": "19860528-0299", "name": "...", "age": 39, "city": "...", "gender": "male" }, ...]
- *
- * For each date+gender combination this script:
- *   1. Searches Ratsit with the date string + gender filter (up to 3 pages = 30 results)
- *   2. For each hit, visits the profile page and intercepts
- *      GET /person/biluppgifter/ to extract the base64-encoded PNR from subjectUri
- *   3. Returns the full list with PNR resolved
- *
- * Errors are written to stderr and the hit is skipped (partial results returned).
- * An empty array is returned on total failure.
+ * Output JSON per person:
+ *   { pnr, name, givenName, age, streetAddress, city, gender,
+ *     married, hasCorporateEngagements, lat, lng,
+ *     phone, vehiclesOnAddress, neighbours }
  */
 
 const { chromium } = require("playwright");
 
-const args      = process.argv.slice(2);
+const args = process.argv.slice(2);
 const USE_STDIN = args[0] === "--stdin";
 
 const PHASE0_PAUSE_MS = Math.round(
-  parseFloat(process.env.PHASE0_PAUSE || "1.0") * 1000
+  parseFloat(process.env.PHASE0_PAUSE || "1.5") * 1000
 );
+
+const BLOCK_PATTERNS = [
+  "**/*.{png,jpg,jpeg,gif,svg,ico,webp,avif}",
+  "**/*.{css,woff,woff2,ttf,eot}",
+  "**/api.pirsch.io/**",
+  "**/fonts.googleapis.com/**",
+  "**/fonts.gstatic.com/**",
+  "**/www.googletagmanager.com/**",
+  "**/www.google-analytics.com/**",
+  "**/analytics.tiktok.com/**",
+  "**/sentry.io/**",
+];
+
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+];
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function jitter(baseMs) {
+  const factor = 0.6 + Math.random() * 0.8;
+  return Math.max(200, Math.round(baseMs * factor));
+}
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
 }
 
 function base64ToPnr(b64) {
@@ -53,11 +71,11 @@ async function dismissCookies(page) {
     await page
       .getByRole("button", { name: "Tillåt alla cookies" })
       .click({ timeout: 3000 });
-    await sleep(400);
+    await sleep(300);
   } catch {}
 }
 
-// ─── search one page, intercept /api/search/combined ─────────────────────────
+// ─── search: intercept /api/search/combined ─────────────────────────────────
 
 function interceptSearchApi(page) {
   let resolve;
@@ -76,24 +94,21 @@ function interceptSearchApi(page) {
     }
   };
   page.on("response", handler);
-  return {
-    promise,
-    cleanup: () => page.off("response", handler),
-  };
+  return { promise, cleanup: () => page.off("response", handler) };
 }
 
 function buildSearchUrl(dateStr, gender, pageNum) {
   const params = new URLSearchParams({
-    vem:  dateStr.replace(/-/g, ""),  // YYYYMMDD
-    m:    gender === "m" ? "1" : "0",
-    k:    gender === "f" ? "1" : "0",
-    r:    "0",
-    er:   "0",
-    b:    "0",
-    eb:   "0",
+    vem: dateStr.replace(/-/g, ""),
+    m: gender === "m" ? "1" : "0",
+    k: gender === "f" ? "1" : "0",
+    r: "0",
+    er: "0",
+    b: "0",
+    eb: "0",
     amin: "16",
     amax: "120",
-    fon:  "1",
+    fon: "0",
     page: String(pageNum),
   });
   return `https://www.ratsit.se/sok/person?${params}`;
@@ -102,8 +117,7 @@ function buildSearchUrl(dateStr, gender, pageNum) {
 async function searchRatsit(page, dateStr, gender) {
   const hits = [];
 
-  // Page 1
-  const url1      = buildSearchUrl(dateStr, gender, 1);
+  const url1 = buildSearchUrl(dateStr, gender, 1);
   const intercept = interceptSearchApi(page);
   await page.goto(url1, { waitUntil: "domcontentloaded", timeout: 30000 });
   await dismissCookies(page);
@@ -113,13 +127,12 @@ async function searchRatsit(page, dateStr, gender) {
   if (!data?.person) return hits;
 
   const pageCount = Math.min(data.person.pager?.pageCount || 1, 3);
-  const rawHits   = (data.person.hits || []).filter((h) => !h.hidden);
+  const rawHits = (data.person.hits || []).filter((h) => !h.hidden);
   hits.push(...rawHits);
 
-  // Pages 2-3
   for (let p = 2; p <= pageCount; p++) {
-    await sleep(PHASE0_PAUSE_MS);
-    const urlN      = buildSearchUrl(dateStr, gender, p);
+    await sleep(jitter(PHASE0_PAUSE_MS));
+    const urlN = buildSearchUrl(dateStr, gender, p);
     const interceptN = interceptSearchApi(page);
     await page.goto(urlN, { waitUntil: "domcontentloaded", timeout: 30000 });
     await dismissCookies(page);
@@ -135,19 +148,28 @@ async function searchRatsit(page, dateStr, gender) {
   return hits;
 }
 
-// ─── resolve PNR from one profile page ───────────────────────────────────────
+// ─── resolve PNR + phone + grannar from profile page ─────────────────────────
 
-async function resolvePnr(page, profileUrl) {
+async function resolveProfile(page, profileUrl) {
   const url = profileUrl.startsWith("http")
     ? profileUrl
     : `https://www.ratsit.se${profileUrl}`;
 
   let pnr = null;
+  let bilData = null;
+  let grannarData = null;
+
   const handler = async (resp) => {
-    if (!resp.url().includes("/person/biluppgifter/")) return;
+    const rUrl = resp.url();
     try {
-      const data = await resp.json();
-      pnr = extractPnrFromSubjectUri(data?.subjectUri);
+      if (rUrl.includes("/person/biluppgifter/")) {
+        bilData = await resp.json();
+        const m = bilData?.subjectUri?.match(/brukare\/([A-Za-z0-9+/=]+)/);
+        if (m) pnr = base64ToPnr(m[1]);
+      }
+      if (rUrl.includes("/personer/grannar/")) {
+        grannarData = await resp.json();
+      }
     } catch {}
   };
 
@@ -157,13 +179,25 @@ async function resolvePnr(page, profileUrl) {
     await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(() => {});
   } catch {}
   page.off("response", handler);
-  return pnr;
+
+  let phone = "";
+  try {
+    const text = await page.evaluate(() => document.body.innerText);
+    const pm = text.match(/Telefonnummer\s*\n([^\n]+)/);
+    if (pm && !pm[1].includes("saknas")) phone = pm[1].trim();
+  } catch {}
+
+  return {
+    pnr,
+    phone,
+    vehiclesOnAddress: bilData?.vehiclesOnAddress?.length ?? 0,
+    neighbours: grannarData?.numberOfNeighbours ?? -1,
+  };
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
 (async () => {
-  // Read input
   let input = {};
   if (USE_STDIN) {
     const chunks = [];
@@ -189,39 +223,39 @@ async function resolvePnr(page, profileUrl) {
 
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    userAgent: pickRandom(USER_AGENTS),
     locale: "sv-SE",
     extraHTTPHeaders: { "Accept-Language": "sv-SE,sv;q=0.9,en;q=0.8" },
   });
   const page = await ctx.newPage();
 
+  for (const pattern of BLOCK_PATTERNS) {
+    await page.route(pattern, (route) => route.abort());
+  }
+
   const results = [];
 
   try {
-    // 1. Search Ratsit for this date+gender
     const rawHits = await searchRatsit(page, dateStr, gender);
     process.stderr.write(
       `${dateStr} gender=${gender}: ${rawHits.length} raw hits\n`
     );
 
-    // 2. Resolve PNR for each hit
     for (let i = 0; i < rawHits.length; i++) {
       const h = rawHits[i];
       if (!h.personUrl) continue;
 
-      await sleep(PHASE0_PAUSE_MS);
+      await sleep(jitter(PHASE0_PAUSE_MS));
 
-      let pnr = null;
+      let profile = { pnr: null, phone: "", vehiclesOnAddress: 0, neighbours: -1 };
       try {
-        pnr = await resolvePnr(page, h.personUrl);
+        profile = await resolveProfile(page, h.personUrl);
       } catch (e) {
         process.stderr.write(`  ERR profile ${h.personUrl}: ${e.message}\n`);
         continue;
       }
 
-      if (!pnr) {
+      if (!profile.pnr) {
         process.stderr.write(
           `  SKIP ${h.firstName || ""} ${h.lastName || ""} — skyddad\n`
         );
@@ -229,16 +263,26 @@ async function resolvePnr(page, profileUrl) {
       }
 
       results.push({
-        pnr,
-        name:   [h.firstName, h.lastName].filter(Boolean).join(" "),
-        age:    h.age || 0,
-        city:   h.city || "",
+        pnr: profile.pnr,
+        name: [h.firstName, h.lastName].filter(Boolean).join(" "),
+        givenName: h.givenName || "",
+        age: h.age || 0,
+        streetAddress: h.streetAddress || "",
+        city: h.city || "",
         gender: h.gender || "",
+        married: h.married ?? null,
+        hasCorporateEngagements: h.hasCorporateEngagements ?? null,
+        lat: h.coordinates?.lat || "",
+        lng: h.coordinates?.lng || "",
+        phone: profile.phone,
+        vehiclesOnAddress: profile.vehiclesOnAddress,
+        neighbours: profile.neighbours,
       });
     }
 
     process.stderr.write(
-      `${dateStr} gender=${gender}: ${results.length} PNRs resolved\n`
+      `${dateStr} gender=${gender}: ${results.length} PNRs resolved, ` +
+      `${results.filter(r => r.phone).length} phones\n`
     );
   } catch (e) {
     process.stderr.write(`Fatal error: ${e.message}\n`);
