@@ -1127,54 +1127,49 @@ def _run(start_year: int, end_year: int, target: int,
             bg_threads.append(phase2e_thread)
             log.info("Phase 2E (Eniro) started in background")
 
-        # Wait for Stage 1 with watchdog — abandon stalled Phase 2E
+        # ── Wait only for Phase 1 (vehicles) ────────────────────────────
+        # Phase 0 (Ratsit) and Phase 2E (Eniro) are supplementary — they
+        # continue as background daemons alongside Phase 2.  Only Phase 1
+        # must finish because it is the heaviest Stage-1 memory user and
+        # its vehicle data feeds into person deduplication.
         db.update_job_state(stage_name="stage1")
-        while bg_threads and not _stop_event.is_set():
-            still_alive = []
-            for t in bg_threads:
-                t.join(timeout=STAGE1_BARRIER_POLL_SECONDS)
-                if t.is_alive():
-                    still_alive.append(t)
+        phase1_thread_ref = next(
+            (t for t in bg_threads if t.name == "phase1"), None)
 
-            if not still_alive:
-                break
+        if phase1_thread_ref and phase1_thread_ref.is_alive():
+            log.info("Stage 1 barrier: waiting for Phase 1 (vehicles) only")
+            db.update_job_state(stage_blockers="phase1")
+            phase1_thread_ref.join()
+            log.info("Phase 1 finished — releasing barrier")
 
-            blocker_names = ",".join(t.name for t in still_alive)
-            db.update_job_state(stage_blockers=blocker_names)
-            log.info("Stage 1 barrier: waiting for %s", blocker_names)
-
-            # Check if Phase 2E is stalled (has its own heartbeat)
-            phase2e_thread = next((t for t in still_alive if t.name == "phase2e"), None)
-            if phase2e_thread:
-                state = db.get_job_state()
-                p2e_hb = state.get("phase2e_last_progress_at", "")
-                if p2e_hb:
-                    try:
-                        age = (datetime.now() - datetime.fromisoformat(p2e_hb)).total_seconds()
-                        if age > PHASE2E_STALL_SECONDS:
-                            log.warning(
-                                "Phase 2E stalled (%ds without progress, limit %ds) — abandoning",
-                                int(age), PHASE2E_STALL_SECONDS,
-                            )
-                            db.update_job_state(phase2e_status="stalled")
-                            still_alive.remove(phase2e_thread)
-                    except ValueError:
-                        pass
-
-            bg_threads = still_alive
-
-        db.update_job_state(stage_blockers="")
+        # Phase 0 and 2E keep running as daemons (they'll finish on their
+        # own or when the container stops).  Report which are still alive.
+        still_bg = [t for t in bg_threads if t.is_alive()]
+        if still_bg:
+            names = ",".join(t.name for t in still_bg)
+            log.info("Background threads continuing alongside Phase 2: %s", names)
+            db.update_job_state(stage_blockers="")
+        else:
+            db.update_job_state(stage_blockers="")
 
         if _stop_event.is_set():
             return
 
-        # ── Stage 2: full-power Phase 2 (gets all RAM) ──────────────────
+        # ── Stage 2: Phase 2 brute-force (runs with bg threads) ─────────
+        # Use fewer workers when Phase 0/2E are still alive to stay under
+        # the 4 GB RAM ceiling.
         db.update_job_state(stage_name="stage2")
         global PARALLEL_WORKERS
         original_workers = PARALLEL_WORKERS
-        PARALLEL_WORKERS = max(original_workers, 8)
-        log.info("Phase 2 starting with %d workers (boosted from %d)",
-                 PARALLEL_WORKERS, original_workers)
+        bg_alive = sum(1 for t in bg_threads if t.is_alive())
+        if bg_alive > 0:
+            PARALLEL_WORKERS = max(original_workers, 6)
+            log.info("Phase 2 starting with %d workers (%d bg threads still alive)",
+                     PARALLEL_WORKERS, bg_alive)
+        else:
+            PARALLEL_WORKERS = max(original_workers, 8)
+            log.info("Phase 2 starting with %d workers (all Stage 1 done)",
+                     PARALLEL_WORKERS)
 
         if not _stop_event.is_set():
             _run_phase2(start_year, end_year, target)
