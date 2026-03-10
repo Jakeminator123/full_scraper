@@ -142,6 +142,7 @@
     </div>
     <div class="bar-track"><div class="bar-fill" id="p3-bar" style="width:0%;background:linear-gradient(90deg,#f97316,var(--yellow))"></div></div>
     <div class="sub" id="p3-detail" style="margin-top:4px"></div>
+    <div class="sub text-yellow" id="p3-waiting" style="margin-top:4px;display:none">Väntar på Fas 2 (körs först)</div>
   </div>
 </div>
 <div class="grid" style="grid-template-columns:1fr 1fr 1fr 1fr">
@@ -396,6 +397,11 @@ async function updateStatus() {
     document.getElementById("p3-bar").style.width = p3pct.toFixed(1) + "%";
     document.getElementById("p3-detail").textContent =
       `${p3pct.toFixed(1)}% · ${fmt(s.phase3_phones || 0)} telefonnr`;
+    // Visa "Väntar på Fas 2" när Fas 3 inte körts än (Fas 2 måste bli klar först)
+    const phase = s.phase || "";
+    const p3Waiting = document.getElementById("p3-waiting");
+    const showWaiting = p3enriched === 0 && p3unenriched > 0 && phase !== "phase3" && phase !== "phase3_done";
+    p3Waiting.style.display = showWaiting ? "block" : "none";
 
     // Phase 2E
     const p2eResolved = s.phase2e_resolved || 0;

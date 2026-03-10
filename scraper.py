@@ -944,7 +944,7 @@ def _run_phase3() -> None:
         return
 
     now_iso = datetime.now().isoformat(timespec="seconds")
-    db.update_job_state(phase="phase3", updated_at=now_iso, last_progress_at=now_iso)
+    db.update_job_state(status="running", phase="phase3", updated_at=now_iso, last_progress_at=now_iso)
 
     while not _stop_event.is_set():
         batch = db.get_unenriched_pnrs(ENRICH_BATCH_SIZE)
@@ -993,6 +993,12 @@ def _run_phase3() -> None:
         )
         log.info("Phase 3: enriched +%d (%d phones), total %d enriched",
                  updated, batch_phones, enriched)
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    if _stop_event.is_set():
+        db.update_job_state(status="paused", phase="phase3", updated_at=now_iso, last_progress_at=now_iso)
+    else:
+        db.update_job_state(status="done", phase="phase3_done", updated_at=now_iso, last_progress_at=now_iso)
 
     log.info("Phase 3 done/paused: %d enriched, %d phones", enriched, phones)
 
@@ -1075,9 +1081,13 @@ def _run(start_year: int, end_year: int, target: int,
         PARALLEL_WORKERS = original_workers
 
         # ── Stage 3: enrichment ──────────────────────────────────────────
-        if not _stop_event.is_set() and db.count_unenriched() > 0:
+        remaining_unenriched = db.count_unenriched()
+        if not _stop_event.is_set() and remaining_unenriched > 0:
             log.info("Phase 3 (Ratsit enrichment) starting after Phase 2")
             _run_phase3()
+        elif not _stop_event.is_set():
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            db.update_job_state(status="done", phase="phase3_done", updated_at=now_iso, last_progress_at=now_iso)
 
     except Exception as e:
         log.exception("Scraper crashed: %s", e)
