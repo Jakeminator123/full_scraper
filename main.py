@@ -168,6 +168,8 @@ def diagnostics_public() -> dict:
         "phase2_found": found,
         "phase2_errors": errors,
         "phase2_hit_rate": round(found / tested * 100, 1) if tested else 0,
+        "phase2e_resolved": state.get("phase2e_resolved", 0),
+        "phase2e_searched": state.get("phase2e_searched", 0),
         "phase3_enriched": state.get("phase3_enriched", 0),
         "phase3_phones": state.get("phase3_phones", 0),
         "phase3_unenriched": db.count_unenriched(),

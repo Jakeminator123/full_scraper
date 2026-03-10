@@ -117,6 +117,9 @@ def init_db() -> None:
         # Phase 3: enrichment pass (added in v6)
         "ALTER TABLE job_state ADD COLUMN phase3_enriched INTEGER DEFAULT 0",
         "ALTER TABLE job_state ADD COLUMN phase3_phones INTEGER DEFAULT 0",
+        # Phase 2E: Eniro-guided (added in v7)
+        "ALTER TABLE job_state ADD COLUMN phase2e_resolved INTEGER DEFAULT 0",
+        "ALTER TABLE job_state ADD COLUMN phase2e_searched INTEGER DEFAULT 0",
         # People-table enrichment columns (added in v5)
         "ALTER TABLE people ADD COLUMN kon TEXT DEFAULT ''",
         "ALTER TABLE people ADD COLUMN gift INTEGER DEFAULT -1",

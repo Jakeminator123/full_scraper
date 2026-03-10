@@ -626,6 +626,161 @@ def _run_phase1() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Phase 2E: Eniro-guided PNR resolution (fast — ~10 biluppgifter req/person)
+# ─────────────────────────────────────────────────────────────────────────────
+
+PHASE2E_BATCH = int(os.environ.get("PHASE2E_BATCH", "5"))
+
+
+def _birthdate_to_candidates(birthdate_str: str) -> list[str]:
+    """Given YYYY-MM-DD, generate all Luhn-valid PNR candidates."""
+    parts = birthdate_str.split("-")
+    if len(parts) != 3:
+        return []
+    try:
+        year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+    except ValueError:
+        return []
+    candidates = []
+    for individ in range(1, 1000):
+        pnr = make_pnr(year, month, day, individ)
+        if pnr:
+            candidates.append(pnr)
+    return candidates
+
+
+def _run_phase2e(start_year: int, end_year: int) -> None:
+    """Eniro-guided PNR resolution: use birthDate to narrow brute-force from 24M to ~100 per person."""
+    import asyncio
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        log.warning("Phase 2E: playwright not installed, skipping")
+        return
+
+    import eniro_helper
+
+    state = db.get_job_state()
+    resolved = state.get("phase2e_resolved", 0)
+    searched = state.get("phase2e_searched", 0)
+
+    unenriched_count = db.count_unenriched()
+    log.info("Phase 2E: Eniro-guided PNR resolution. %d unenriched, %d already resolved",
+             unenriched_count, resolved)
+
+    if unenriched_count == 0:
+        log.info("Phase 2E: nothing to resolve")
+        return
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    db.update_job_state(phase="phase2e", updated_at=now_iso, last_progress_at=now_iso)
+
+    async def _eniro_loop():
+        nonlocal resolved, searched
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            try:
+                while not _stop_event.is_set():
+                    batch = db.get_unenriched_pnrs(PHASE2E_BATCH)
+                    if not batch:
+                        break
+
+                    for person in batch:
+                        if _stop_event.is_set():
+                            break
+
+                        namn = person.get("namn", "")
+                        stad = person.get("stad", "")
+                        pnr = person.get("pnr", "")
+                        if not namn:
+                            continue
+
+                        searched += 1
+                        log.info("Phase 2E: searching Eniro for '%s' (%s)", namn, stad)
+
+                        try:
+                            eniro_data = await eniro_helper.resolve_birthdate(browser, namn, stad)
+                        except Exception as e:
+                            log.warning("Phase 2E: Eniro error for '%s': %s", namn, e)
+                            continue
+
+                        if not eniro_data or not eniro_data.get("birthDate"):
+                            log.info("Phase 2E: no birthDate for '%s'", namn)
+                            db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_miss"})
+                            continue
+
+                        birth = eniro_data["birthDate"]
+                        telefon_eniro = eniro_data.get("telefon", "")
+                        postnr = eniro_data.get("postnummer", "")
+
+                        enrich_fields = {"kalla": "biluppgifter+eniro"}
+                        if telefon_eniro:
+                            enrich_fields["telefon"] = telefon_eniro
+                        if postnr:
+                            enrich_fields["postnummer"] = postnr
+
+                        candidates = _birthdate_to_candidates(birth)
+                        log.info("Phase 2E: '%s' born %s → %d PNR candidates, testing...",
+                                 namn, birth, len(candidates))
+
+                        target_parts = set(namn.lower().split())
+                        matched = False
+
+                        for i in range(0, len(candidates), BATCH_SIZE):
+                            if _stop_event.is_set():
+                                break
+                            chunk = candidates[i:i + BATCH_SIZE]
+                            urls = [_pnr_to_url(c) for c in chunk]
+                            html_map = _fetch_batch(urls)
+
+                            for c_pnr in chunk:
+                                url = _pnr_to_url(c_pnr)
+                                html = html_map.get(url)
+                                if not html:
+                                    continue
+                                person_data = _parse_brukare(html, c_pnr)
+                                if not person_data:
+                                    continue
+                                found_parts = set(person_data["namn"].lower().split())
+                                if target_parts & found_parts:
+                                    person_data.update(enrich_fields)
+                                    db.insert_people_batch([person_data])
+                                    resolved += 1
+                                    matched = True
+                                    log.info("Phase 2E: MATCHED '%s' → %s (attempt %d)",
+                                             namn, c_pnr, i + chunk.index(c_pnr) + 1)
+                                    break
+
+                            if matched:
+                                break
+
+                        if not matched:
+                            db.enrich_person(pnr, enrich_fields)
+                            log.info("Phase 2E: no biluppgifter match for '%s' (tested %d candidates)",
+                                     namn, len(candidates))
+
+                        now_iso = datetime.now().isoformat(timespec="seconds")
+                        db.update_job_state(
+                            phase2e_resolved=resolved,
+                            phase2e_searched=searched,
+                            updated_at=now_iso,
+                            last_progress_at=now_iso,
+                        )
+
+                        await asyncio.sleep(eniro_helper._jitter(1.0))
+
+            finally:
+                await browser.close()
+
+    try:
+        asyncio.run(_eniro_loop())
+    except Exception as e:
+        log.exception("Phase 2E crashed: %s", e)
+
+    log.info("Phase 2E done/paused: %d searched, %d resolved", searched, resolved)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Phase 2: PNR enumeration with parallel workers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -881,6 +1036,16 @@ def _run(start_year: int, end_year: int, target: int,
             bg_threads.append(phase1_thread)
             log.info("Phase 1 started in background thread")
 
+        # Phase 2E: Eniro-guided PNR resolution (before blind brute-force)
+        if not _stop_event.is_set() and db.count_unenriched() > 0:
+            log.info("Phase 2E (Eniro-guided) starting — resolves PNR via birthDate")
+            _run_phase2e(start_year, end_year)
+            if _stop_event.is_set():
+                for t in bg_threads:
+                    if t.is_alive():
+                        t.join(timeout=10)
+                return
+
         # Phase 2 runs in main thread — gets full CPU/RAM
         if not _stop_event.is_set():
             _run_phase2(start_year, end_year, target)
@@ -1040,6 +1205,9 @@ def get_status() -> dict:
         "phase0_days_done":     p0_days_done,
         "phase0_days_total":    total_days,
         "phase0_phones":        state.get("phase0_phones", 0),
+        # Phase 2E (Eniro-guided)
+        "phase2e_resolved":     state.get("phase2e_resolved", 0),
+        "phase2e_searched":     state.get("phase2e_searched", 0),
         # Phase 3 (enrichment)
         "phase3_enriched":      state.get("phase3_enriched", 0),
         "phase3_phones":        state.get("phase3_phones", 0),
