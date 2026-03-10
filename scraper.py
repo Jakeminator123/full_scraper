@@ -739,26 +739,35 @@ def _run_phase2(start_year: int, end_year: int, target: int) -> None:
 
 def _run(start_year: int, end_year: int, target: int,
          skip_phase1: bool = False, skip_phase0: bool = False) -> None:
+    """Run scraping phases SEQUENTIALLY to stay within 4 GB RAM.
+
+    Old design ran all phases in parallel, but each phase launches its own
+    Chromium instances (~200 MB each).  With Phase 0 now doing profile visits,
+    running everything at once exceeds the 4 GB memory limit and OOM-kills
+    the container every ~20 minutes.
+
+    New order:
+      1. Phase 0 (Ratsit) — runs alone, 1 Chromium, ~400 MB
+      2. Phase 1 (vehicles) — runs in background during Phase 2
+      3. Phase 2 (PNR brute-force) — main workload
+    """
     try:
         state = db.get_job_state()
         phase = state.get("phase", "")
 
-        bg_threads: list[threading.Thread] = []
-
-        # Phase 0: Ratsit harvesting in background (parallel, conservative rate)
+        # Phase 0: Ratsit harvesting — runs FIRST, alone
         phase0_needed = (
             not skip_phase0
             and phase not in ("phase0_done",)
         )
         if phase0_needed and not _stop_event.is_set():
-            phase0_thread = threading.Thread(
-                target=_run_phase0, args=(start_year, end_year),
-                daemon=True, name="phase0")
-            phase0_thread.start()
-            bg_threads.append(phase0_thread)
-            log.info("Phase 0 (Ratsit harvesting) started in background thread")
+            log.info("Phase 0 (Ratsit harvesting) starting — runs alone to save RAM")
+            _run_phase0(start_year, end_year)
+            if _stop_event.is_set():
+                return
 
-        # Phase 1: vehicle prefix enumeration in background
+        # Phase 1: vehicle prefix enumeration in background (low memory)
+        bg_threads: list[threading.Thread] = []
         phase1_needed = (not skip_phase1 and phase not in ("phase1_done",))
         if phase1_needed and not _stop_event.is_set():
             phase1_thread = threading.Thread(
@@ -767,7 +776,7 @@ def _run(start_year: int, end_year: int, target: int,
             bg_threads.append(phase1_thread)
             log.info("Phase 1 started in background thread")
 
-        # Phase 2 runs in main thread — skips PNRs found by Phase 0
+        # Phase 2 runs in main thread
         if not _stop_event.is_set():
             _run_phase2(start_year, end_year, target)
 

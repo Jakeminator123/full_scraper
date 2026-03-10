@@ -129,6 +129,57 @@ def health() -> dict:
     return {"ok": True, "service": "full-scraper"}
 
 
+@app.get("/diag", tags=["meta"])
+def diagnostics_public() -> dict:
+    """Quick diagnostics — no auth required. Safe to bookmark/webhook."""
+    state = db.get_job_state()
+    total = db.count_people()
+    enrichment = db.count_enrichment()
+    phase = state.get("phase", "idle")
+    status = state.get("status", "idle")
+
+    p0_found = state.get("phase0_found", 0)
+    p0_phones = state.get("phase0_phones", 0)
+    p0_date = state.get("phase0_date", "")
+
+    tested = state.get("total_tested", 0)
+    found = state.get("total_found", 0)
+    errors = state.get("total_errors", 0)
+
+    heartbeat = state.get("last_progress_at", "") or state.get("updated_at", "")
+    heartbeat_age = None
+    if heartbeat:
+        try:
+            heartbeat_age = max(0, int((datetime.now() - datetime.fromisoformat(heartbeat)).total_seconds()))
+        except ValueError:
+            pass
+
+    return {
+        "ok": status not in ("error",),
+        "status": status,
+        "phase": phase,
+        "is_running": scraper.is_running(),
+        "total_people": total,
+        "total_vehicles": db.count_vehicles(),
+        "phase0_found": p0_found,
+        "phase0_phones": p0_phones,
+        "phase0_date": p0_date,
+        "phase2_tested": tested,
+        "phase2_found": found,
+        "phase2_errors": errors,
+        "phase2_hit_rate": round(found / tested * 100, 1) if tested else 0,
+        "enrichment_telefon": enrichment.get("med_telefon", 0),
+        "enrichment_kon": enrichment.get("med_kon", 0),
+        "enrichment_gps": enrichment.get("med_gps", 0),
+        "enrichment_fran_ratsit": enrichment.get("fran_ratsit", 0),
+        "heartbeat_age_seconds": heartbeat_age,
+        "heartbeat_stale": heartbeat_age is not None and heartbeat_age > scraper.HEARTBEAT_STALE_SECONDS,
+        "db_size_mb": round(db.db_file_size_mb(), 1),
+        "parallel_workers": scraper.PARALLEL_WORKERS,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 # ── Status ────────────────────────────────────────────────────────────────────
 
 @app.get("/status", tags=["job"])
