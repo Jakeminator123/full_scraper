@@ -436,12 +436,14 @@ def _run_phase0(start_year: int, end_year: int) -> None:
     log.info("Phase 0: Ratsit date-harvesting. Resume from '%s', found so far: %d",
              resume_date or "start", found)
     now_iso = datetime.now().isoformat(timespec="seconds")
-    db.update_job_state(status="running", phase="phase0", updated_at=now_iso, last_progress_at=now_iso)
+    db.update_job_state(status="running", phase="phase0", phase0_status="running",
+                        updated_at=now_iso, last_progress_at=now_iso)
 
     dates_processed = 0
     for d in _iter_dates(start_year, end_year, resume_date):
         if _stop_event.is_set():
             db.update_job_state(status="paused", phase="phase0",
+                                phase0_status="paused",
                                 phase0_date=d.isoformat(),
                                 updated_at=datetime.now().isoformat(timespec="seconds"))
             log.info("Phase 0 paused at %s", d.isoformat())
@@ -454,6 +456,7 @@ def _run_phase0(start_year: int, end_year: int) -> None:
         for gender in ("m", "f"):
             if _stop_event.is_set():
                 db.update_job_state(status="paused", phase="phase0",
+                                    phase0_status="paused",
                                     phase0_date=date_str,
                                     updated_at=datetime.now().isoformat(timespec="seconds"))
                 return
@@ -522,7 +525,8 @@ def _run_phase0(start_year: int, end_year: int) -> None:
 
     log.info("Phase 0 complete: %d dates, %d people found, %d phones", dates_processed, found, phones)
     now_iso = datetime.now().isoformat(timespec="seconds")
-    db.update_job_state(phase="phase0_done", phase0_found=found, phase0_phones=phones,
+    db.update_job_state(phase="phase0_done", phase0_status="done",
+                        phase0_found=found, phase0_phones=phones,
                         updated_at=now_iso, last_progress_at=now_iso)
 
 
@@ -545,12 +549,14 @@ def _run_phase1() -> None:
     log.info("Phase 1: prefix enumeration. Resume from '%s', %d prefixes done",
              resume_prefix, prefixes_done)
     now_iso = datetime.now().isoformat(timespec="seconds")
-    db.update_job_state(status="running", phase="phase1", updated_at=now_iso, last_progress_at=now_iso)
+    db.update_job_state(status="running", phase="phase1", phase1_status="running",
+                        updated_at=now_iso, last_progress_at=now_iso)
 
     for prefix in _iter_prefixes(resume_prefix):
         if _stop_event.is_set():
             db.update_job_state(
                 status="paused",
+                phase1_status="paused",
                 phase1_prefix=prefix,
                 updated_at=datetime.now().isoformat(timespec="seconds"),
             )
@@ -562,6 +568,7 @@ def _run_phase1() -> None:
             if _stop_event.is_set():
                 db.update_job_state(
                     status="paused",
+                    phase1_status="paused",
                     phase1_prefix=prefix,
                     updated_at=datetime.now().isoformat(timespec="seconds"),
                 )
@@ -618,6 +625,7 @@ def _run_phase1() -> None:
     now_iso = datetime.now().isoformat(timespec="seconds")
     db.update_job_state(
         phase="phase1_done",
+        phase1_status="done",
         phase1_prefixes_done=prefixes_done,
         phase1_vehicles=vehicles_found,
         updated_at=now_iso,
@@ -664,16 +672,18 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
     resolved = state.get("phase2e_resolved", 0)
     searched = state.get("phase2e_searched", 0)
 
-    unenriched_count = db.count_unenriched()
-    log.info("Phase 2E: Eniro-guided PNR resolution. %d unenriched, %d already resolved",
-             unenriched_count, resolved)
+    eniro_pending = db.count_eniro_pending()
+    log.info("Phase 2E: Eniro-guided PNR resolution. %d pending, %d already resolved",
+             eniro_pending, resolved)
 
-    if unenriched_count == 0:
+    if eniro_pending == 0:
         log.info("Phase 2E: nothing to resolve")
+        db.update_job_state(phase2e_status="done")
         return
 
     now_iso = datetime.now().isoformat(timespec="seconds")
-    db.update_job_state(phase="phase2e", updated_at=now_iso, last_progress_at=now_iso)
+    db.update_job_state(phase="phase2e", phase2e_status="running",
+                        updated_at=now_iso, last_progress_at=now_iso)
 
     async def _eniro_loop():
         nonlocal resolved, searched
@@ -681,7 +691,7 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
             browser = await pw.chromium.launch(headless=True)
             try:
                 while not _stop_event.is_set():
-                    batch = db.get_unenriched_pnrs(PHASE2E_BATCH)
+                    batch = db.get_eniro_pending_pnrs(PHASE2E_BATCH)
                     if not batch:
                         break
 
@@ -776,6 +786,13 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
         asyncio.run(_eniro_loop())
     except Exception as e:
         log.exception("Phase 2E crashed: %s", e)
+        db.update_job_state(phase2e_status="error")
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    if _stop_event.is_set():
+        db.update_job_state(phase2e_status="paused", updated_at=now_iso, last_progress_at=now_iso)
+    else:
+        db.update_job_state(phase2e_status="done", updated_at=now_iso, last_progress_at=now_iso)
 
     log.info("Phase 2E done/paused: %d searched, %d resolved", searched, resolved)
 
@@ -1033,7 +1050,7 @@ def _run(start_year: int, end_year: int, target: int,
             and phase not in ("phase0_done",)
         )
         phase1_needed = (not skip_phase1 and phase not in ("phase1_done",))
-        phase2e_needed = db.count_unenriched() > 0
+        phase2e_needed = db.count_eniro_pending() > 0
 
         if phase0_needed and not _stop_event.is_set():
             phase0_thread = threading.Thread(
@@ -1233,9 +1250,12 @@ def get_status() -> dict:
         "phase0_days_done":     p0_days_done,
         "phase0_days_total":    total_days,
         "phase0_phones":        state.get("phase0_phones", 0),
+        "phase0_status":        state.get("phase0_status", "idle"),
         # Phase 2E (Eniro-guided)
         "phase2e_resolved":     state.get("phase2e_resolved", 0),
         "phase2e_searched":     state.get("phase2e_searched", 0),
+        "phase2e_status":       state.get("phase2e_status", "idle"),
+        "phase2e_pending":      db.count_eniro_pending(),
         # Phase 3 (enrichment)
         "phase3_enriched":      state.get("phase3_enriched", 0),
         "phase3_phones":        state.get("phase3_phones", 0),
@@ -1245,6 +1265,7 @@ def get_status() -> dict:
         "phase1_prefixes_total": TOTAL_PREFIXES,
         "phase1_pct":           p1_pct,
         "phase1_vehicles":      p1_vehicles,
+        "phase1_status":        state.get("phase1_status", "idle"),
         # Phase 2
         "start_year":           sy,
         "end_year":             ey,

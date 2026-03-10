@@ -126,7 +126,7 @@
 <!-- Row 2: Phase progress -->
 <div class="grid" style="grid-template-columns:1fr 1fr">
   <div class="card">
-    <h3>Fas 0 — Ratsit Harvesting</h3>
+    <h3>Fas 0 — Ratsit Harvesting <span class="status-dot" id="p0-dot"></span></h3>
     <div class="flex-between">
       <span class="big" style="color:var(--purple);font-size:24px" id="p0-found">—</span>
       <span class="sub" id="p0-date"></span>
@@ -147,7 +147,7 @@
 </div>
 <div class="grid" style="grid-template-columns:1fr 1fr 1fr 1fr">
   <div class="card">
-    <h3>Fas 2E — Eniro Resolver</h3>
+    <h3>Fas 2E — Eniro Resolver <span class="status-dot" id="p2e-dot"></span></h3>
     <div class="flex-between">
       <span class="big" style="color:var(--green);font-size:22px" id="p2e-resolved">—</span>
       <span class="sub" id="p2e-searched"></span>
@@ -155,7 +155,7 @@
     <div class="sub" style="margin-top:4px" id="p2e-detail">birthDate → Luhn → bil</div>
   </div>
   <div class="card">
-    <h3>Fas 1 — Fordon</h3>
+    <h3>Fas 1 — Fordon <span class="status-dot" id="p1-dot"></span></h3>
     <div class="flex-between">
       <span class="big" style="color:var(--cyan);font-size:24px" id="p1-vehicles">—</span>
       <span class="sub" id="p1-prefix"></span>
@@ -326,6 +326,13 @@ function enrichBar(id, count, total) {
   document.getElementById(id).textContent = fmt(count);
 }
 
+function setPhaseDot(id, phaseStatus) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const cls = {running:"dot-running",paused:"dot-paused",done:"dot-done",error:"dot-error",idle:"dot-idle"};
+  el.className = "status-dot " + (cls[phaseStatus] || "dot-idle");
+}
+
 async function updateStatus() {
   try {
     const s = await fetchApi("/status");
@@ -373,12 +380,14 @@ async function updateStatus() {
     const p0phones = s.phase0_phones || 0;
     document.getElementById("p0-pct").textContent =
       `${s.phase0_pct_done||0}% · ${fmt(p0phones)} telefonnr · ${s.phase0_days_done||0}/${s.phase0_days_total||0} dagar`;
+    setPhaseDot("p0-dot", s.phase0_status);
 
     // Phase 1
     document.getElementById("p1-vehicles").textContent = fmt(s.phase1_vehicles || 0);
     document.getElementById("p1-prefix").textContent = `${fmt(s.phase1_prefixes_done||0)}/${fmt(s.phase1_prefixes_total||17576)}`;
     document.getElementById("p1-bar").style.width = (s.phase1_pct || 0) + "%";
     document.getElementById("p1-pct").textContent = `${s.phase1_pct||0}%`;
+    setPhaseDot("p1-dot", s.phase1_status);
 
     // Phase 2
     document.getElementById("p2-found").textContent = fmt(s.total_found || 0);
@@ -406,10 +415,19 @@ async function updateStatus() {
     // Phase 2E
     const p2eResolved = s.phase2e_resolved || 0;
     const p2eSearched = s.phase2e_searched || 0;
+    const p2eStatus = s.phase2e_status || "idle";
     document.getElementById("p2e-resolved").textContent = fmt(p2eResolved);
     document.getElementById("p2e-searched").textContent = `${fmt(p2eSearched)} sökta`;
-    document.getElementById("p2e-detail").textContent =
-      p2eSearched > 0 ? `${p2eResolved}/${p2eSearched} matchade via Eniro` : "birthDate → Luhn → bil";
+    setPhaseDot("p2e-dot", p2eStatus);
+    if (p2eStatus === "done") {
+      document.getElementById("p2e-detail").textContent = `Klar: ${p2eResolved}/${p2eSearched} matchade`;
+    } else if (p2eStatus === "error") {
+      document.getElementById("p2e-detail").textContent = "Fel — se loggar";
+    } else if (p2eSearched > 0) {
+      document.getElementById("p2e-detail").textContent = `${p2eResolved}/${p2eSearched} matchade via Eniro`;
+    } else {
+      document.getElementById("p2e-detail").textContent = "birthDate \u2192 Luhn \u2192 bil";
+    }
 
     // Enrichment bars
     const e = s.enrichment || {};

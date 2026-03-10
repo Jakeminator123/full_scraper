@@ -120,6 +120,10 @@ def init_db() -> None:
         # Phase 2E: Eniro-guided (added in v7)
         "ALTER TABLE job_state ADD COLUMN phase2e_resolved INTEGER DEFAULT 0",
         "ALTER TABLE job_state ADD COLUMN phase2e_searched INTEGER DEFAULT 0",
+        # Per-phase status fields for Stage 1 parallel tracking (added in v8)
+        "ALTER TABLE job_state ADD COLUMN phase0_status TEXT DEFAULT 'idle'",
+        "ALTER TABLE job_state ADD COLUMN phase1_status TEXT DEFAULT 'idle'",
+        "ALTER TABLE job_state ADD COLUMN phase2e_status TEXT DEFAULT 'idle'",
         # People-table enrichment columns (added in v5)
         "ALTER TABLE people ADD COLUMN kon TEXT DEFAULT ''",
         "ALTER TABLE people ADD COLUMN gift INTEGER DEFAULT -1",
@@ -487,6 +491,24 @@ def get_unenriched_pnrs(limit: int = 50) -> list[dict]:
 def count_unenriched() -> int:
     row = _conn().execute(
         "SELECT COUNT(*) FROM people WHERE kalla NOT LIKE '%ratsit%' AND namn != ''"
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def get_eniro_pending_pnrs(limit: int = 50) -> list[dict]:
+    """Return people not yet processed by Phase 2E (no eniro tag in kalla)."""
+    rows = _conn().execute(
+        """SELECT pnr, namn, alder, stad FROM people
+           WHERE kalla NOT LIKE '%eniro%' AND kalla NOT LIKE '%ratsit%' AND namn != ''
+           ORDER BY rowid ASC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_eniro_pending() -> int:
+    row = _conn().execute(
+        "SELECT COUNT(*) FROM people WHERE kalla NOT LIKE '%eniro%' AND kalla NOT LIKE '%ratsit%' AND namn != ''"
     ).fetchone()
     return row[0] if row else 0
 
