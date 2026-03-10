@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import db
@@ -90,6 +90,18 @@ def require_auth(
 
 
 Auth = Annotated[None, Depends(require_auth)]
+
+
+DASHBOARD_URL = os.environ.get(
+    "DASHBOARD_URL", "https://full-scraper-dashboard.vercel.app"
+)
+
+
+# ── Root redirect ────────────────────────────────────────────────────────────
+
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(DASHBOARD_URL)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
