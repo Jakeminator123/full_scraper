@@ -34,6 +34,10 @@ services:
         value: "10400000"
       - key: HEARTBEAT_STALE_SECONDS
         value: "300"
+      - key: PHASE2E_STALL_SECONDS
+        value: "600"
+      - key: STAGE1_BARRIER_POLL_SECONDS
+        value: "30"
       - key: AUTO_RESUME
         value: "true"
       - key: DATA_DIR

@@ -329,7 +329,8 @@ function enrichBar(id, count, total) {
 function setPhaseDot(id, phaseStatus) {
   const el = document.getElementById(id);
   if (!el) return;
-  const cls = {running:"dot-running",paused:"dot-paused",done:"dot-done",error:"dot-error",idle:"dot-idle"};
+  const cls = {running:"dot-running",paused:"dot-paused",done:"dot-done",
+    error:"dot-error",idle:"dot-idle",stalled:"dot-error"};
   el.className = "status-dot " + (cls[phaseStatus] || "dot-idle");
 }
 
@@ -344,7 +345,10 @@ async function updateStatus() {
     const dotCls = {running:"dot-running",paused:"dot-paused",
       error:"dot-error",done:"dot-done",idle:"dot-idle"};
     dot.className = "status-dot " + (dotCls[status] || "dot-idle");
-    document.getElementById("status-text").textContent = `${status} — fas ${s.phase || "idle"}`;
+    const stageTxt = s.stage_name ? ` [${s.stage_name}]` : "";
+    const blockerTxt = s.stage_blockers ? ` blockerad av: ${s.stage_blockers}` : "";
+    document.getElementById("status-text").textContent =
+      `${status} — fas ${s.phase || "idle"}${stageTxt}${blockerTxt}`;
     document.getElementById("last-update").textContent = new Date().toLocaleTimeString("sv-SE");
 
     const warn = document.getElementById("heartbeat-warning");
@@ -406,11 +410,22 @@ async function updateStatus() {
     document.getElementById("p3-bar").style.width = p3pct.toFixed(1) + "%";
     document.getElementById("p3-detail").textContent =
       `${p3pct.toFixed(1)}% · ${fmt(s.phase3_phones || 0)} telefonnr`;
-    // Visa "Väntar på Fas 2" när Fas 3 inte körts än (Fas 2 måste bli klar först)
     const phase = s.phase || "";
     const p3Waiting = document.getElementById("p3-waiting");
     const showWaiting = p3enriched === 0 && p3unenriched > 0 && phase !== "phase3" && phase !== "phase3_done";
-    p3Waiting.style.display = showWaiting ? "block" : "none";
+    if (showWaiting) {
+      const stage = s.stage_name || "";
+      const blockers = s.stage_blockers || "";
+      let waitMsg = "Vantar pa Fas 2 (kors forst)";
+      if (stage === "stage1" && blockers)
+        waitMsg = `Vantar: Stage 1 blockeras av ${blockers}`;
+      else if (stage === "stage2")
+        waitMsg = "Vantar: Fas 2 kor just nu";
+      p3Waiting.textContent = waitMsg;
+      p3Waiting.style.display = "block";
+    } else {
+      p3Waiting.style.display = "none";
+    }
 
     // Phase 2E
     const p2eResolved = s.phase2e_resolved || 0;
@@ -419,7 +434,11 @@ async function updateStatus() {
     document.getElementById("p2e-resolved").textContent = fmt(p2eResolved);
     document.getElementById("p2e-searched").textContent = `${fmt(p2eSearched)} sökta`;
     setPhaseDot("p2e-dot", p2eStatus);
-    if (p2eStatus === "done") {
+    if (p2eStatus === "stalled") {
+      const age = s.phase2e_last_progress_age;
+      document.getElementById("p2e-detail").textContent =
+        `Stallad (${age != null ? Math.round(age/60) + "m utan progress" : "?"}) — Fas 2 startade anda`;
+    } else if (p2eStatus === "done") {
       document.getElementById("p2e-detail").textContent = `Klar: ${p2eResolved}/${p2eSearched} matchade`;
     } else if (p2eStatus === "error") {
       document.getElementById("p2e-detail").textContent = "Fel — se loggar";

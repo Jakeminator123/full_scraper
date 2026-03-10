@@ -53,6 +53,8 @@ START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
 END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
 TARGET_PEOPLE_DEFAULT = int(os.environ.get("TARGET_PEOPLE_DEFAULT", "10400000"))
 HEARTBEAT_STALE_SECONDS = int(os.environ.get("HEARTBEAT_STALE_SECONDS", "300"))
+PHASE2E_STALL_SECONDS   = int(os.environ.get("PHASE2E_STALL_SECONDS",   "600"))
+STAGE1_BARRIER_POLL_SECONDS = int(os.environ.get("STAGE1_BARRIER_POLL_SECONDS", "30"))
 
 _thread:     threading.Thread | None = None
 _stop_event: threading.Event          = threading.Event()
@@ -735,6 +737,7 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                             now_iso = datetime.now().isoformat(timespec="seconds")
                             db.update_job_state(
                                 phase2e_resolved=resolved, phase2e_searched=searched,
+                                phase2e_last_progress_at=now_iso,
                                 updated_at=now_iso, last_progress_at=now_iso,
                             )
                             continue
@@ -750,6 +753,12 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                                     pass
                                 browser = await pw.chromium.launch(headless=True)
                                 consecutive_errors = 0
+                            now_iso = datetime.now().isoformat(timespec="seconds")
+                            db.update_job_state(
+                                phase2e_resolved=resolved, phase2e_searched=searched,
+                                phase2e_last_progress_at=now_iso,
+                                updated_at=now_iso, last_progress_at=now_iso,
+                            )
                             continue
 
                         if not eniro_data or not eniro_data.get("birthDate"):
@@ -810,6 +819,7 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                         db.update_job_state(
                             phase2e_resolved=resolved,
                             phase2e_searched=searched,
+                            phase2e_last_progress_at=now_iso,
                             updated_at=now_iso,
                             last_progress_at=now_iso,
                         )
@@ -830,9 +840,11 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
 
     now_iso = datetime.now().isoformat(timespec="seconds")
     if _stop_event.is_set():
-        db.update_job_state(phase2e_status="paused", updated_at=now_iso, last_progress_at=now_iso)
+        db.update_job_state(phase2e_status="paused", phase2e_last_progress_at=now_iso,
+                            updated_at=now_iso, last_progress_at=now_iso)
     else:
-        db.update_job_state(phase2e_status="done", updated_at=now_iso, last_progress_at=now_iso)
+        db.update_job_state(phase2e_status="done", phase2e_last_progress_at=now_iso,
+                            updated_at=now_iso, last_progress_at=now_iso)
 
     log.info("Phase 2E done/paused: %d searched, %d resolved", searched, resolved)
 
@@ -1115,17 +1127,49 @@ def _run(start_year: int, end_year: int, target: int,
             bg_threads.append(phase2e_thread)
             log.info("Phase 2E (Eniro) started in background")
 
-        # Wait for Stage 1 to finish (Phase 0, 1, 2E all complete)
-        for t in bg_threads:
-            if t.is_alive():
-                log.info("Waiting for %s to finish...", t.name)
-                t.join()
-        bg_threads.clear()
+        # Wait for Stage 1 with watchdog — abandon stalled Phase 2E
+        db.update_job_state(stage_name="stage1")
+        while bg_threads and not _stop_event.is_set():
+            still_alive = []
+            for t in bg_threads:
+                t.join(timeout=STAGE1_BARRIER_POLL_SECONDS)
+                if t.is_alive():
+                    still_alive.append(t)
+
+            if not still_alive:
+                break
+
+            blocker_names = ",".join(t.name for t in still_alive)
+            db.update_job_state(stage_blockers=blocker_names)
+            log.info("Stage 1 barrier: waiting for %s", blocker_names)
+
+            # Check if Phase 2E is stalled (has its own heartbeat)
+            phase2e_thread = next((t for t in still_alive if t.name == "phase2e"), None)
+            if phase2e_thread:
+                state = db.get_job_state()
+                p2e_hb = state.get("phase2e_last_progress_at", "")
+                if p2e_hb:
+                    try:
+                        age = (datetime.now() - datetime.fromisoformat(p2e_hb)).total_seconds()
+                        if age > PHASE2E_STALL_SECONDS:
+                            log.warning(
+                                "Phase 2E stalled (%ds without progress, limit %ds) — abandoning",
+                                int(age), PHASE2E_STALL_SECONDS,
+                            )
+                            db.update_job_state(phase2e_status="stalled")
+                            still_alive.remove(phase2e_thread)
+                    except ValueError:
+                        pass
+
+            bg_threads = still_alive
+
+        db.update_job_state(stage_blockers="")
 
         if _stop_event.is_set():
             return
 
         # ── Stage 2: full-power Phase 2 (gets all RAM) ──────────────────
+        db.update_job_state(stage_name="stage2")
         global PARALLEL_WORKERS
         original_workers = PARALLEL_WORKERS
         PARALLEL_WORKERS = max(original_workers, 8)
@@ -1138,6 +1182,7 @@ def _run(start_year: int, end_year: int, target: int,
         PARALLEL_WORKERS = original_workers
 
         # ── Stage 3: enrichment ──────────────────────────────────────────
+        db.update_job_state(stage_name="stage3")
         remaining_unenriched = db.count_unenriched()
         if not _stop_event.is_set() and remaining_unenriched > 0:
             log.info("Phase 3 (Ratsit enrichment) starting after Phase 2")
@@ -1278,11 +1323,22 @@ def get_status() -> dict:
     speed_people = float(state.get("speed_people_per_hour", 0) or 0)
     speed_tested = float(state.get("speed_tested_per_hour", 0) or 0)
 
+    p2e_hb_at = state.get("phase2e_last_progress_at", "")
+    p2e_hb_age = None
+    if p2e_hb_at:
+        try:
+            p2e_hb_age = max(0, int((now - datetime.fromisoformat(p2e_hb_at)).total_seconds()))
+        except ValueError:
+            pass
+
     return {
         "status":               state.get("status", "idle"),
         "phase":                phase,
         "is_running":           is_running(),
         "parallel_workers":     PARALLEL_WORKERS,
+        # Stage barrier
+        "stage_name":           state.get("stage_name", ""),
+        "stage_blockers":       state.get("stage_blockers", ""),
         # Phase 0
         "phase0_date":          p0_date,
         "phase0_found":         p0_found,
@@ -1296,6 +1352,8 @@ def get_status() -> dict:
         "phase2e_searched":     state.get("phase2e_searched", 0),
         "phase2e_status":       state.get("phase2e_status", "idle"),
         "phase2e_pending":      db.count_eniro_pending(),
+        "phase2e_last_progress_age": p2e_hb_age,
+        "phase2e_stall_seconds": PHASE2E_STALL_SECONDS,
         # Phase 3 (enrichment)
         "phase3_enriched":      state.get("phase3_enriched", 0),
         "phase3_phones":        state.get("phase3_phones", 0),

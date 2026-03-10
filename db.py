@@ -124,6 +124,10 @@ def init_db() -> None:
         "ALTER TABLE job_state ADD COLUMN phase0_status TEXT DEFAULT 'idle'",
         "ALTER TABLE job_state ADD COLUMN phase1_status TEXT DEFAULT 'idle'",
         "ALTER TABLE job_state ADD COLUMN phase2e_status TEXT DEFAULT 'idle'",
+        # Stage barrier telemetry + Phase 2E dedicated heartbeat (added in v9)
+        "ALTER TABLE job_state ADD COLUMN stage_name TEXT DEFAULT ''",
+        "ALTER TABLE job_state ADD COLUMN stage_blockers TEXT DEFAULT ''",
+        "ALTER TABLE job_state ADD COLUMN phase2e_last_progress_at TEXT DEFAULT ''",
         # People-table enrichment columns (added in v5)
         "ALTER TABLE people ADD COLUMN kon TEXT DEFAULT ''",
         "ALTER TABLE people ADD COLUMN gift INTEGER DEFAULT -1",
