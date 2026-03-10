@@ -56,6 +56,9 @@ TARGET_PEOPLE_DEFAULT = int(os.environ.get("TARGET_PEOPLE_DEFAULT", "10400000"))
 HEARTBEAT_STALE_SECONDS = int(os.environ.get("HEARTBEAT_STALE_SECONDS", "300"))
 PHASE2E_STALL_SECONDS   = int(os.environ.get("PHASE2E_STALL_SECONDS",   "600"))
 STAGE1_BARRIER_POLL_SECONDS = int(os.environ.get("STAGE1_BARRIER_POLL_SECONDS", "30"))
+STAGE1_BARRIER_TIMEOUT  = int(os.environ.get("STAGE1_BARRIER_TIMEOUT",  "7200"))
+PHASE2E_MISS_THRESHOLD  = int(os.environ.get("PHASE2E_MISS_THRESHOLD",  "40"))
+PHASE2E_CF_BACKOFF_MAX  = float(os.environ.get("PHASE2E_CF_BACKOFF_MAX", "120"))
 
 _thread:     threading.Thread | None = None
 _stop_event: threading.Event          = threading.Event()
@@ -722,6 +725,9 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             consecutive_errors = 0
+            consecutive_misses = 0
+            cf_backoff = 0.0
+            seen_names: set[str] = set()
 
             try:
                 while not _stop_event.is_set():
@@ -740,8 +746,20 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                             db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_skip"})
                             continue
 
+                        name_key = f"{namn.lower()}|{stad.lower()}"
+                        if name_key in seen_names:
+                            db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_dedup"})
+                            continue
+                        seen_names.add(name_key)
+
                         searched += 1
-                        log.info("Phase 2E: searching Eniro for '%s' (%s)", namn, stad)
+                        log.info("Phase 2E: searching Eniro for '%s' (%s) [%d/%d, %.1f%% hit]",
+                                 namn, stad, resolved, searched,
+                                 (resolved / searched * 100) if searched else 0)
+
+                        if cf_backoff > 0:
+                            log.info("Phase 2E: CF backoff %.0fs", cf_backoff)
+                            await asyncio.sleep(cf_backoff)
 
                         try:
                             eniro_data = await asyncio.wait_for(
@@ -749,10 +767,13 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                                 timeout=PERSON_TIMEOUT,
                             )
                             consecutive_errors = 0
+                            cf_backoff = max(0, cf_backoff - 5)
                         except asyncio.TimeoutError:
                             log.warning("Phase 2E: HARD TIMEOUT (%ds) for '%s' — skipping", PERSON_TIMEOUT, namn)
                             db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_timeout"})
                             consecutive_errors += 1
+                            consecutive_misses += 1
+                            cf_backoff = min(cf_backoff + 15, PHASE2E_CF_BACKOFF_MAX)
                             if consecutive_errors >= CONSECUTIVE_ERRORS_RESTART:
                                 log.warning("Phase 2E: %d consecutive errors — restarting browser", consecutive_errors)
                                 try:
@@ -772,6 +793,8 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                             log.warning("Phase 2E: Eniro error for '%s': %s", namn, e)
                             db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_error"})
                             consecutive_errors += 1
+                            consecutive_misses += 1
+                            cf_backoff = min(cf_backoff + 10, PHASE2E_CF_BACKOFF_MAX)
                             if consecutive_errors >= CONSECUTIVE_ERRORS_RESTART:
                                 log.warning("Phase 2E: %d consecutive errors — restarting browser", consecutive_errors)
                                 try:
@@ -791,6 +814,19 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                         if not eniro_data or not eniro_data.get("birthDate"):
                             log.info("Phase 2E: no birthDate for '%s'", namn)
                             db.enrich_person(pnr, {"kalla": "biluppgifter+eniro_miss"})
+                            consecutive_misses += 1
+                            cf_backoff = min(cf_backoff + 2, PHASE2E_CF_BACKOFF_MAX)
+
+                            hit_rate = resolved / searched if searched else 0
+                            if (consecutive_misses >= PHASE2E_MISS_THRESHOLD
+                                    and searched >= PHASE2E_MISS_THRESHOLD
+                                    and hit_rate < 0.05):
+                                log.warning(
+                                    "Phase 2E: %d consecutive misses, %.1f%% hit rate "
+                                    "(%d/%d) — suspending to save resources",
+                                    consecutive_misses, hit_rate * 100, resolved, searched,
+                                )
+                                break
                         else:
                             birth = eniro_data["birthDate"]
                             telefon_eniro = eniro_data.get("telefon", "")
@@ -842,6 +878,9 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                                 log.info("Phase 2E: no biluppgifter match for '%s' (tested %d candidates)",
                                          namn, len(candidates))
 
+                            consecutive_misses = 0
+                            cf_backoff = max(0, cf_backoff - 10)
+
                         now_iso = datetime.now().isoformat(timespec="seconds")
                         db.update_job_state(
                             phase2e_resolved=resolved,
@@ -852,6 +891,9 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
                         )
 
                         await asyncio.sleep(eniro_helper._jitter(1.0))
+                    else:
+                        continue
+                    break
 
             finally:
                 try:
@@ -1164,18 +1206,27 @@ def _run(start_year: int, end_year: int, target: int,
             (t for t in bg_threads if t.name == "phase1"), None)
 
         if phase1_thread_ref and phase1_thread_ref.is_alive():
-            log.info("Stage 1 barrier: waiting for Phase 1 (vehicles) only")
+            log.info("Stage 1 barrier: waiting for Phase 1 (max %ds)", STAGE1_BARRIER_TIMEOUT)
             db.update_job_state(stage_blockers="phase1")
-            phase1_thread_ref.join()
-            log.info("Phase 1 finished — releasing barrier")
+            phase1_thread_ref.join(timeout=STAGE1_BARRIER_TIMEOUT)
+            if phase1_thread_ref.is_alive():
+                log.warning(
+                    "Phase 1 still running after %ds — starting Phase 2 with reduced workers",
+                    STAGE1_BARRIER_TIMEOUT,
+                )
+                db.update_job_state(stage_blockers="phase1(timeout)")
+            else:
+                log.info("Phase 1 finished — releasing barrier")
 
         # Phase 0 and 2E keep running as daemons (they'll finish on their
         # own or when the container stops).  Report which are still alive.
         still_bg = [t for t in bg_threads if t.is_alive()]
+        barrier_timed_out = phase1_thread_ref and phase1_thread_ref.is_alive()
         if still_bg:
             names = ",".join(t.name for t in still_bg)
             log.info("Background threads continuing alongside Phase 2: %s", names)
-            db.update_job_state(stage_blockers="")
+            if not barrier_timed_out:
+                db.update_job_state(stage_blockers="")
         else:
             db.update_job_state(stage_blockers="")
 
@@ -1189,7 +1240,12 @@ def _run(start_year: int, end_year: int, target: int,
         global PARALLEL_WORKERS
         original_workers = PARALLEL_WORKERS
         bg_alive = sum(1 for t in bg_threads if t.is_alive())
-        if bg_alive > 0:
+        phase1_still_alive = phase1_thread_ref and phase1_thread_ref.is_alive()
+        if phase1_still_alive:
+            PARALLEL_WORKERS = max(2, min(original_workers, 4))
+            log.info("Phase 2 starting with %d workers (Phase 1 still running after barrier timeout)",
+                     PARALLEL_WORKERS)
+        elif bg_alive > 0:
             PARALLEL_WORKERS = max(original_workers, 6)
             log.info("Phase 2 starting with %d workers (%d bg threads still alive)",
                      PARALLEL_WORKERS, bg_alive)

@@ -38,6 +38,12 @@ services:
         value: "600"
       - key: STAGE1_BARRIER_POLL_SECONDS
         value: "30"
+      - key: STAGE1_BARRIER_TIMEOUT
+        value: "7200"
+      - key: PHASE2E_MISS_THRESHOLD
+        value: "40"
+      - key: PHASE2E_CF_BACKOFF_MAX
+        value: "120"
       - key: AUTO_RESUME
         value: "true"
       - key: DATA_DIR
