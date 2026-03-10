@@ -173,6 +173,8 @@ def diagnostics_public() -> dict:
         "phase2e_status": state.get("phase2e_status", "idle"),
         "phase0_status": state.get("phase0_status", "idle"),
         "phase1_status": state.get("phase1_status", "idle"),
+        "phase1_prefix": state.get("phase1_prefix", ""),
+        "phase1_page": state.get("phase1_page", 0),
         "stage_name": state.get("stage_name", ""),
         "stage_blockers": state.get("stage_blockers", ""),
         "phase2e_last_progress_at": state.get("phase2e_last_progress_at", ""),

@@ -162,6 +162,7 @@
     </div>
     <div class="bar-track"><div class="bar-fill bar-blue" id="p1-bar" style="width:0%"></div></div>
     <div class="sub" id="p1-pct" style="margin-top:4px"></div>
+    <div class="sub text-cyan" id="p1-live" style="margin-top:2px;display:none"></div>
   </div>
   <div class="card">
     <h3>Fas 2 — PNR Brute-force</h3>
@@ -334,6 +335,62 @@ function setPhaseDot(id, phaseStatus) {
   el.className = "status-dot " + (cls[phaseStatus] || "dot-idle");
 }
 
+function labelForStage(stage) {
+  const map = {
+    stage1: "Steg 1",
+    stage2: "Steg 2",
+    stage3: "Steg 3",
+  };
+  return map[stage] || stage || "";
+}
+
+function labelForPhase(phase) {
+  const map = {
+    phase0: "Fas 0 (Ratsit Harvesting)",
+    phase1: "Fas 1 (Fordon)",
+    phase2: "Fas 2 (PNR Brute-force)",
+    phase2e: "Fas 2E (Eniro Resolver)",
+    phase3: "Fas 3 (Ratsit Enrichment)",
+    phase0_done: "Fas 0 klar",
+    phase1_done: "Fas 1 klar",
+    phase3_done: "Fas 3 klar",
+    idle: "idle",
+  };
+  return map[phase] || phase || "idle";
+}
+
+function labelForBlockers(raw) {
+  if (!raw) return "";
+  const parts = String(raw)
+    .split(",")
+    .map(p => p.trim())
+    .filter(Boolean);
+  return parts.map(p => labelForPhase(p)).join(", ");
+}
+
+function buildMainStatusText(s) {
+  const status = s.status || "idle";
+  const stage = s.stage_name || "";
+  const blockers = s.stage_blockers || "";
+  let flow = labelForPhase(s.phase || "idle");
+
+  if (stage === "stage1") {
+    const active = [];
+    if ((s.phase0_status || "idle") === "running") active.push(labelForPhase("phase0"));
+    if ((s.phase1_status || "idle") === "running") active.push(labelForPhase("phase1"));
+    if ((s.phase2e_status || "idle") === "running") active.push(labelForPhase("phase2e"));
+    const activeTxt = active.length ? ` · aktiva faser: ${active.join(", ")}` : "";
+    flow = `${labelForStage(stage)}${activeTxt}`;
+  } else if (stage === "stage2") {
+    flow = `${labelForStage(stage)} · ${labelForPhase("phase2")}`;
+  } else if (stage === "stage3") {
+    flow = `${labelForStage(stage)} · ${labelForPhase("phase3")}`;
+  }
+
+  const blockerTxt = blockers ? ` · väntar på: ${labelForBlockers(blockers)}` : "";
+  return `${status} — ${flow}${blockerTxt}`;
+}
+
 async function updateStatus() {
   try {
     const s = await fetchApi("/status");
@@ -345,10 +402,7 @@ async function updateStatus() {
     const dotCls = {running:"dot-running",paused:"dot-paused",
       error:"dot-error",done:"dot-done",idle:"dot-idle"};
     dot.className = "status-dot " + (dotCls[status] || "dot-idle");
-    const stageTxt = s.stage_name ? ` [${s.stage_name}]` : "";
-    const blockerTxt = s.stage_blockers ? ` blockerad av: ${s.stage_blockers}` : "";
-    document.getElementById("status-text").textContent =
-      `${status} — fas ${s.phase || "idle"}${stageTxt}${blockerTxt}`;
+    document.getElementById("status-text").textContent = buildMainStatusText(s);
     document.getElementById("last-update").textContent = new Date().toLocaleTimeString("sv-SE");
 
     const warn = document.getElementById("heartbeat-warning");
@@ -387,11 +441,30 @@ async function updateStatus() {
     setPhaseDot("p0-dot", s.phase0_status);
 
     // Phase 1
+    const p1Done = s.phase1_prefixes_done || 0;
+    const p1Total = s.phase1_prefixes_total || 17576;
+    const p1Prefix = (s.phase1_prefix || "").toUpperCase();
+    const p1Page = s.phase1_page || 0;
+    const p1Status = s.phase1_status || "idle";
     document.getElementById("p1-vehicles").textContent = fmt(s.phase1_vehicles || 0);
-    document.getElementById("p1-prefix").textContent = `${fmt(s.phase1_prefixes_done||0)}/${fmt(s.phase1_prefixes_total||17576)}`;
+    document.getElementById("p1-prefix").textContent = `${fmt(p1Done)}/${fmt(p1Total)}`;
     document.getElementById("p1-bar").style.width = (s.phase1_pct || 0) + "%";
     document.getElementById("p1-pct").textContent = `${s.phase1_pct||0}%`;
-    setPhaseDot("p1-dot", s.phase1_status);
+    setPhaseDot("p1-dot", p1Status);
+    const p1Live = document.getElementById("p1-live");
+    if (p1Status === "running" && p1Prefix) {
+      const pageTxt = p1Page > 0 ? ` · sida ${fmt(p1Page)}` : "";
+      p1Live.textContent = `Kör prefix ${p1Prefix}${pageTxt}`;
+      p1Live.style.display = "block";
+    } else if (p1Status === "done") {
+      p1Live.textContent = "Klar";
+      p1Live.style.display = "block";
+    } else if (p1Status === "paused" && p1Prefix) {
+      p1Live.textContent = `Pausad vid prefix ${p1Prefix}`;
+      p1Live.style.display = "block";
+    } else {
+      p1Live.style.display = "none";
+    }
 
     // Phase 2
     document.getElementById("p2-found").textContent = fmt(s.total_found || 0);
@@ -418,7 +491,7 @@ async function updateStatus() {
       const blockers = s.stage_blockers || "";
       let waitMsg = "Vantar pa Fas 2 (kors forst)";
       if (stage === "stage1" && blockers)
-        waitMsg = `Vantar: Stage 1 blockeras av ${blockers}`;
+        waitMsg = `Vantar: ${labelForStage(stage)} invantar ${labelForBlockers(blockers)}`;
       else if (stage === "stage2")
         waitMsg = "Vantar: Fas 2 kor just nu";
       p3Waiting.textContent = waitMsg;

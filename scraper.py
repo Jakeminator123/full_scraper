@@ -30,6 +30,7 @@ import json
 import subprocess
 import threading
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Generator
@@ -552,7 +553,10 @@ def _run_phase1() -> None:
              resume_prefix, prefixes_done)
     now_iso = datetime.now().isoformat(timespec="seconds")
     db.update_job_state(status="running", phase="phase1", phase1_status="running",
-                        updated_at=now_iso, last_progress_at=now_iso)
+                        phase1_page=1, updated_at=now_iso, last_progress_at=now_iso)
+    # Keep Phase 1 visibly alive in dashboard even when one prefix has many pages.
+    phase1_live_interval_s = max(5, STAGE1_BARRIER_POLL_SECONDS // 3)
+    last_live_update = 0.0
 
     for prefix in _iter_prefixes(resume_prefix):
         if _stop_event.is_set():
@@ -560,18 +564,27 @@ def _run_phase1() -> None:
                 status="paused",
                 phase1_status="paused",
                 phase1_prefix=prefix,
+                phase1_page=1,
                 updated_at=datetime.now().isoformat(timespec="seconds"),
             )
             log.info("Phase 1 paused at prefix %s", prefix)
             return
 
         page_num = 1
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        db.update_job_state(
+            phase1_prefix=prefix,
+            phase1_page=page_num,
+            updated_at=now_iso,
+            last_progress_at=now_iso,
+        )
         while True:
             if _stop_event.is_set():
                 db.update_job_state(
                     status="paused",
                     phase1_status="paused",
                     phase1_prefix=prefix,
+                    phase1_page=page_num,
                     updated_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 return
@@ -606,6 +619,18 @@ def _run_phase1() -> None:
                         })
             vehicles_found += db.insert_vehicles_batch(batch_vehicles)
 
+            now_mono = time.monotonic()
+            if now_mono - last_live_update >= phase1_live_interval_s:
+                now_iso = datetime.now().isoformat(timespec="seconds")
+                db.update_job_state(
+                    phase1_prefix=prefix,
+                    phase1_page=page_num,
+                    phase1_vehicles=vehicles_found,
+                    updated_at=now_iso,
+                    last_progress_at=now_iso,
+                )
+                last_live_update = now_mono
+
             if not any_results:
                 break
             page_num += PARALLEL_WORKERS
@@ -614,6 +639,7 @@ def _run_phase1() -> None:
         now_iso = datetime.now().isoformat(timespec="seconds")
         db.update_job_state(
             phase1_prefix=prefix,
+            phase1_page=page_num,
             phase1_prefixes_done=prefixes_done,
             phase1_vehicles=vehicles_found,
             updated_at=now_iso,
@@ -628,6 +654,7 @@ def _run_phase1() -> None:
     db.update_job_state(
         phase="phase1_done",
         phase1_status="done",
+        phase1_page=0,
         phase1_prefixes_done=prefixes_done,
         phase1_vehicles=vehicles_found,
         updated_at=now_iso,
@@ -684,7 +711,7 @@ def _run_phase2e(start_year: int, end_year: int) -> None:
         return
 
     now_iso = datetime.now().isoformat(timespec="seconds")
-    db.update_job_state(phase="phase2e", phase2e_status="running",
+    db.update_job_state(phase2e_status="running",
                         updated_at=now_iso, last_progress_at=now_iso)
 
     PERSON_TIMEOUT = 180  # max seconds per person (Eniro + biluppgifter)
@@ -1276,6 +1303,8 @@ def get_status() -> dict:
     # Phase 1 stats
     p1_prefixes = state.get("phase1_prefixes_done", 0)
     p1_vehicles = state.get("phase1_vehicles", 0)
+    p1_prefix = state.get("phase1_prefix", "")
+    p1_page = state.get("phase1_page", 0)
     p1_pct      = round(p1_prefixes / TOTAL_PREFIXES * 100, 1) if p1_prefixes else 0
 
     eta_seconds = None
@@ -1357,6 +1386,8 @@ def get_status() -> dict:
         "phase1_prefixes_done": p1_prefixes,
         "phase1_prefixes_total": TOTAL_PREFIXES,
         "phase1_pct":           p1_pct,
+        "phase1_prefix":        p1_prefix,
+        "phase1_page":          p1_page,
         "phase1_vehicles":      p1_vehicles,
         "phase1_status":        state.get("phase1_status", "idle"),
         # Phase 2

@@ -76,6 +76,7 @@ def init_db() -> None:
             phase                  TEXT    DEFAULT '',
             -- Phase 1: prefix enumeration
             phase1_prefix          TEXT    DEFAULT '',
+            phase1_page            INTEGER DEFAULT 0,
             phase1_prefixes_done   INTEGER DEFAULT 0,
             phase1_vehicles        INTEGER DEFAULT 0,
             -- Phase 2: PNR enumeration
@@ -100,6 +101,7 @@ def init_db() -> None:
     migrations = [
         "ALTER TABLE job_state ADD COLUMN phase TEXT DEFAULT ''",
         "ALTER TABLE job_state ADD COLUMN phase1_prefix TEXT DEFAULT ''",
+        "ALTER TABLE job_state ADD COLUMN phase1_page INTEGER DEFAULT 0",
         "ALTER TABLE job_state ADD COLUMN phase1_prefixes_done INTEGER DEFAULT 0",
         "ALTER TABLE job_state ADD COLUMN phase1_vehicles INTEGER DEFAULT 0",
         # Phase 0 columns (added in v3)
