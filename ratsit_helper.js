@@ -187,7 +187,11 @@ async function resolveProfile(page, profileUrl) {
   try {
     const text = await page.evaluate(() => document.body.innerText);
     const pm = text.match(/Telefonnummer\s*\n([^\n]+)/);
-    if (pm && !pm[1].includes("saknas")) phone = pm[1].trim();
+    if (pm && !pm[1].includes("saknas")) {
+      const raw = pm[1].trim();
+      const numMatch = raw.match(/^(\d[\d\s-]{6,15}\d)/);
+      phone = numMatch ? numMatch[1].trim() : "";
+    }
   } catch {}
 
   return {
