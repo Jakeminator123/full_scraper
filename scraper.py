@@ -87,6 +87,37 @@ def _safe_str(value, default: str = "") -> str:
     return str(value)
 
 
+def normalize_run_options(
+    *,
+    people_first: bool = False,
+    skip_phase0: bool = False,
+    skip_phase1: bool = False,
+    skip_phase2e: bool = False,
+    skip_phase3: bool = False,
+) -> dict[str, bool | str]:
+    if people_first:
+        skip_phase1 = True
+        skip_phase2e = True
+        skip_phase3 = True
+
+    inferred_people_first = (
+        not skip_phase0
+        and skip_phase1
+        and skip_phase2e
+        and skip_phase3
+    )
+    run_mode = "people_first" if (people_first or inferred_people_first) else "standard"
+
+    return {
+        "run_mode": run_mode,
+        "people_first": run_mode == "people_first",
+        "skip_phase0": bool(skip_phase0),
+        "skip_phase1": bool(skip_phase1),
+        "skip_phase2e": bool(skip_phase2e),
+        "skip_phase3": bool(skip_phase3),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Luhn PNR generation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1168,7 +1199,9 @@ def _run_phase3() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run(start_year: int, end_year: int, target: int,
-         skip_phase1: bool = False, skip_phase0: bool = False) -> None:
+         skip_phase1: bool = False, skip_phase0: bool = False,
+         skip_phase2e: bool = False, skip_phase3: bool = False,
+         run_mode: str = "standard") -> None:
     """Run scraping phases with smart parallelism within 4 GB RAM.
 
     Stage 1 — parallel harvest (~1.5 GB total):
@@ -1186,6 +1219,15 @@ def _run(start_year: int, end_year: int, target: int,
         state = db.get_job_state()
         phase = state.get("phase", "")
         bg_threads: list[threading.Thread] = []
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        db.update_job_state(
+            run_mode=run_mode,
+            skip_phase0=int(skip_phase0),
+            skip_phase1=int(skip_phase1),
+            skip_phase2e=int(skip_phase2e),
+            skip_phase3=int(skip_phase3),
+            updated_at=now_iso,
+        )
 
         # ── Stage 1: parallel harvest ────────────────────────────────────
         phase0_needed = (
@@ -1193,7 +1235,7 @@ def _run(start_year: int, end_year: int, target: int,
             and phase not in ("phase0_done",)
         )
         phase1_needed = (not skip_phase1 and phase not in ("phase1_done",))
-        phase2e_needed = db.count_eniro_pending() > 0
+        phase2e_needed = (not skip_phase2e and db.count_eniro_pending() > 0)
 
         if phase0_needed and not _stop_event.is_set():
             phase0_thread = threading.Thread(
@@ -1261,16 +1303,27 @@ def _run(start_year: int, end_year: int, target: int,
         db.update_job_state(stage_name="stage2")
         global PARALLEL_WORKERS
         original_workers = PARALLEL_WORKERS
-        bg_alive = sum(1 for t in bg_threads if t.is_alive())
+        bg_alive_names = {t.name for t in bg_threads if t.is_alive()}
+        bg_alive = len(bg_alive_names)
         phase1_still_alive = phase1_thread_ref and phase1_thread_ref.is_alive()
+        phase0_alive = "phase0" in bg_alive_names
+        phase2e_alive = "phase2e" in bg_alive_names
         if phase1_still_alive:
             PARALLEL_WORKERS = max(2, min(original_workers, 4))
             log.info("Phase 2 starting with %d workers (Phase 1 still running after barrier timeout)",
                      PARALLEL_WORKERS)
-        elif bg_alive > 0:
+        elif phase2e_alive:
             PARALLEL_WORKERS = max(original_workers, 6)
-            log.info("Phase 2 starting with %d workers (%d bg threads still alive)",
+            log.info("Phase 2 starting with %d workers (Phase 2E still alive; %d bg threads total)",
                      PARALLEL_WORKERS, bg_alive)
+        elif phase0_alive:
+            PARALLEL_WORKERS = max(original_workers, 8)
+            if run_mode == "people_first":
+                log.info("Phase 2 starting with %d workers (people-first mode; only Phase 0 still alive)",
+                         PARALLEL_WORKERS)
+            else:
+                log.info("Phase 2 starting with %d workers (only Phase 0 still alive)",
+                         PARALLEL_WORKERS)
         else:
             PARALLEL_WORKERS = max(original_workers, 8)
             log.info("Phase 2 starting with %d workers (all Stage 1 done)",
@@ -1284,7 +1337,11 @@ def _run(start_year: int, end_year: int, target: int,
         # ── Stage 3: enrichment ──────────────────────────────────────────
         db.update_job_state(stage_name="stage3")
         remaining_unenriched = db.count_unenriched()
-        if not _stop_event.is_set() and remaining_unenriched > 0:
+        if not _stop_event.is_set() and skip_phase3:
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            log.info("Phase 3 skipped by run mode (%s)", run_mode)
+            db.update_job_state(status="done", phase="phase3_done", updated_at=now_iso, last_progress_at=now_iso)
+        elif not _stop_event.is_set() and remaining_unenriched > 0:
             log.info("Phase 3 (Ratsit enrichment) starting after Phase 2")
             _run_phase3()
         elif not _stop_event.is_set():
@@ -1306,16 +1363,41 @@ def _run(start_year: int, end_year: int, target: int,
 
 def start(target: int = 0, start_year: int | None = None,
           end_year: int | None = None, skip_phase1: bool = False,
-          skip_phase0: bool = False) -> bool:
+          skip_phase0: bool = False, skip_phase2e: bool = False,
+          skip_phase3: bool = False, people_first: bool = False) -> bool:
     global _thread
     with _state_lock:
         if _thread is not None and _thread.is_alive():
             return False
         _stop_event.clear()
+        options = normalize_run_options(
+            people_first=people_first,
+            skip_phase0=skip_phase0,
+            skip_phase1=skip_phase1,
+            skip_phase2e=skip_phase2e,
+            skip_phase3=skip_phase3,
+        )
         sy = start_year or START_YEAR
         ey = end_year   or END_YEAR
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        db.update_job_state(
+            run_mode=str(options["run_mode"]),
+            skip_phase0=int(bool(options["skip_phase0"])),
+            skip_phase1=int(bool(options["skip_phase1"])),
+            skip_phase2e=int(bool(options["skip_phase2e"])),
+            skip_phase3=int(bool(options["skip_phase3"])),
+            updated_at=now_iso,
+        )
         _thread = threading.Thread(
-            target=_run, args=(sy, ey, target, skip_phase1, skip_phase0),
+            target=_run,
+            args=(
+                sy, ey, target,
+                bool(options["skip_phase1"]),
+                bool(options["skip_phase0"]),
+                bool(options["skip_phase2e"]),
+                bool(options["skip_phase3"]),
+                str(options["run_mode"]),
+            ),
             daemon=True, name="scraper",
         )
         _thread.start()
@@ -1346,6 +1428,21 @@ def get_status() -> dict:
     state  = db.get_job_state()
     now    = datetime.now()
     phase  = _safe_str(state.get("phase", "idle"), "idle")
+    run_mode = _safe_str(state.get("run_mode", "standard"), "standard") or "standard"
+    skip_phase0 = bool(_safe_int(state.get("skip_phase0", 0), 0))
+    skip_phase1 = bool(_safe_int(state.get("skip_phase1", 0), 0))
+    skip_phase2e = bool(_safe_int(state.get("skip_phase2e", 0), 0))
+    skip_phase3 = bool(_safe_int(state.get("skip_phase3", 0), 0))
+    skipped_phases = [
+        phase_name
+        for phase_name, is_skipped in (
+            ("phase0", skip_phase0),
+            ("phase1", skip_phase1),
+            ("phase2e", skip_phase2e),
+            ("phase3", skip_phase3),
+        )
+        if is_skipped
+    ]
     sy     = _safe_int(state.get("start_year", START_YEAR), START_YEAR)
     ey     = max(sy, _safe_int(state.get("end_year", END_YEAR), END_YEAR))
     cy     = _safe_int(state.get("current_year", sy), sy)
@@ -1437,6 +1534,13 @@ def get_status() -> dict:
         "status":               status,
         "phase":                phase,
         "is_running":           is_running(),
+        "run_mode":             run_mode,
+        "people_first":         run_mode == "people_first",
+        "skip_phase0":          skip_phase0,
+        "skip_phase1":          skip_phase1,
+        "skip_phase2e":         skip_phase2e,
+        "skip_phase3":          skip_phase3,
+        "skipped_phases":       skipped_phases,
         "parallel_workers":     PARALLEL_WORKERS,
         # Stage barrier
         "stage_name":           _safe_str(state.get("stage_name", ""), ""),
@@ -1518,4 +1622,14 @@ def maybe_auto_resume() -> None:
         target = state.get("target_people", 0)
         sy     = state.get("start_year", START_YEAR)
         ey     = state.get("end_year",   END_YEAR)
-        start(target=target, start_year=sy, end_year=ey)
+        run_mode = _safe_str(state.get("run_mode", "standard"), "standard") or "standard"
+        start(
+            target=target,
+            start_year=sy,
+            end_year=ey,
+            skip_phase0=bool(_safe_int(state.get("skip_phase0", 0), 0)),
+            skip_phase1=bool(_safe_int(state.get("skip_phase1", 0), 0)),
+            skip_phase2e=bool(_safe_int(state.get("skip_phase2e", 0), 0)),
+            skip_phase3=bool(_safe_int(state.get("skip_phase3", 0), 0)),
+            people_first=run_mode == "people_first",
+        )

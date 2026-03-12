@@ -76,6 +76,11 @@ def init_db() -> None:
             id                     INTEGER PRIMARY KEY DEFAULT 1,
             status                 TEXT    DEFAULT 'idle',
             phase                  TEXT    DEFAULT '',
+            run_mode               TEXT    DEFAULT 'standard',
+            skip_phase0            INTEGER DEFAULT 0,
+            skip_phase1            INTEGER DEFAULT 0,
+            skip_phase2e           INTEGER DEFAULT 0,
+            skip_phase3            INTEGER DEFAULT 0,
             -- Phase 1: prefix enumeration
             phase1_prefix          TEXT    DEFAULT '',
             phase1_page            INTEGER DEFAULT 0,
@@ -132,6 +137,12 @@ def init_db() -> None:
         "ALTER TABLE job_state ADD COLUMN stage_name TEXT DEFAULT ''",
         "ALTER TABLE job_state ADD COLUMN stage_blockers TEXT DEFAULT ''",
         "ALTER TABLE job_state ADD COLUMN phase2e_last_progress_at TEXT DEFAULT ''",
+        # Run-mode controls (added in v10)
+        "ALTER TABLE job_state ADD COLUMN run_mode TEXT DEFAULT 'standard'",
+        "ALTER TABLE job_state ADD COLUMN skip_phase0 INTEGER DEFAULT 0",
+        "ALTER TABLE job_state ADD COLUMN skip_phase1 INTEGER DEFAULT 0",
+        "ALTER TABLE job_state ADD COLUMN skip_phase2e INTEGER DEFAULT 0",
+        "ALTER TABLE job_state ADD COLUMN skip_phase3 INTEGER DEFAULT 0",
         # People-table enrichment columns (added in v5)
         "ALTER TABLE people ADD COLUMN kon TEXT DEFAULT ''",
         "ALTER TABLE people ADD COLUMN gift INTEGER DEFAULT -1",

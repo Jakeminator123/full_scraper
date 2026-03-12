@@ -158,6 +158,12 @@ def diagnostics_public() -> dict:
         "ok": status not in ("error",),
         "status": status,
         "phase": phase,
+        "run_mode": state.get("run_mode", "standard") or "standard",
+        "people_first": (state.get("run_mode", "standard") or "standard") == "people_first",
+        "skip_phase0": bool(int(state.get("skip_phase0", 0) or 0)),
+        "skip_phase1": bool(int(state.get("skip_phase1", 0) or 0)),
+        "skip_phase2e": bool(int(state.get("skip_phase2e", 0) or 0)),
+        "skip_phase3": bool(int(state.get("skip_phase3", 0) or 0)),
         "is_running": scraper.is_running(),
         "total_people": total,
         "total_vehicles": db.count_vehicles(),
@@ -368,24 +374,42 @@ def job_start(
     target:      int  = Query(0,     ge=0,             description="Stop after N people found (0 = unlimited; dashboard still tracks TARGET_PEOPLE_DEFAULT)"),
     start_year:  int  = Query(None,  ge=1900, le=2010, description="Override START_YEAR"),
     end_year:    int  = Query(None,  ge=1900, le=2010, description="Override END_YEAR"),
+    people_first: bool = Query(False,                description="Prioritise pnr + namn + stad by skipping secondary phases where possible"),
     skip_phase0: bool = Query(False,                   description="Skip Ratsit date-harvesting (Phase 0)"),
     skip_phase1: bool = Query(False,                   description="Skip vehicle prefix enumeration (Phase 1)"),
+    skip_phase2e: bool = Query(False,                  description="Skip Eniro-guided resolver (Phase 2E)"),
+    skip_phase3: bool = Query(False,                   description="Skip Ratsit enrichment pass (Phase 3)"),
 ) -> dict:
     if scraper.is_running():
         raise HTTPException(status_code=409, detail="Scraper is already running.")
 
+    options = scraper.normalize_run_options(
+        people_first=people_first,
+        skip_phase0=skip_phase0,
+        skip_phase1=skip_phase1,
+        skip_phase2e=skip_phase2e,
+        skip_phase3=skip_phase3,
+    )
     ok = scraper.start(target=target, start_year=start_year,
-                       end_year=end_year, skip_phase1=skip_phase1,
-                       skip_phase0=skip_phase0)
+                       end_year=end_year,
+                       people_first=bool(options["people_first"]),
+                       skip_phase1=bool(options["skip_phase1"]),
+                       skip_phase0=bool(options["skip_phase0"]),
+                       skip_phase2e=bool(options["skip_phase2e"]),
+                       skip_phase3=bool(options["skip_phase3"]))
     if not ok:
         raise HTTPException(status_code=409, detail="Could not start scraper.")
 
     return {
         "started": True,
+        "run_mode": options["run_mode"],
+        "people_first": options["people_first"],
         "target": target,
         "target_goal": target if target > 0 else scraper.TARGET_PEOPLE_DEFAULT,
-        "skip_phase0": skip_phase0,
-        "skip_phase1": skip_phase1,
+        "skip_phase0": options["skip_phase0"],
+        "skip_phase1": options["skip_phase1"],
+        "skip_phase2e": options["skip_phase2e"],
+        "skip_phase3": options["skip_phase3"],
     }
 
 
