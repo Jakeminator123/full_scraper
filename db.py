@@ -7,6 +7,7 @@ Tables:
   job_state  — single row tracking the scraper's position and counters
 """
 
+import logging
 import sqlite3
 import os
 import threading
@@ -17,6 +18,7 @@ DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
 DB_PATH  = os.path.join(DATA_DIR, "people.db")
 
 _local = threading.local()
+log = logging.getLogger("db")
 
 
 def _conn() -> sqlite3.Connection:
@@ -230,13 +232,18 @@ def update_status_snapshot(total_people: int, total_tested: int) -> dict[str, fl
     people_speed = round(people_speed, 2)
     tested_speed = round(tested_speed, 2)
 
-    update_job_state(
-        status_snapshot_at=now_iso,
-        status_snapshot_people=max(0, int(total_people)),
-        status_snapshot_tested=max(0, int(total_tested)),
-        speed_people_per_hour=people_speed,
-        speed_tested_per_hour=tested_speed,
-    )
+    try:
+        update_job_state(
+            status_snapshot_at=now_iso,
+            status_snapshot_people=max(0, int(total_people)),
+            status_snapshot_tested=max(0, int(total_tested)),
+            speed_people_per_hour=people_speed,
+            speed_tested_per_hour=tested_speed,
+        )
+    except sqlite3.Error as exc:
+        # Dashboard polling must stay read-mostly; a locked snapshot write should
+        # not take down the whole /status endpoint.
+        log.warning("Could not persist status snapshot: %s", exc)
 
     return {
         "status_snapshot_at": now_iso,

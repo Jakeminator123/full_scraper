@@ -65,6 +65,28 @@ _stop_event: threading.Event          = threading.Event()
 _state_lock: threading.Lock           = threading.Lock()
 
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_str(value, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Luhn PNR generation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1323,18 +1345,18 @@ def is_running() -> bool:
 def get_status() -> dict:
     state  = db.get_job_state()
     now    = datetime.now()
-    phase  = state.get("phase", "idle")
-    sy     = state.get("start_year",  START_YEAR)
-    ey     = state.get("end_year",    END_YEAR)
-    cy     = state.get("current_year",  sy)
-    cm     = state.get("current_month",  1)
-    cd     = state.get("current_day",    1)
-    ci     = state.get("current_individ", 1)
-    tested = state.get("total_tested",   0)
-    found  = state.get("total_found",    0)
-    n_f    = state.get("total_not_found",0)
-    errs   = state.get("total_errors",   0)
-    target = state.get("target_people",  0)
+    phase  = _safe_str(state.get("phase", "idle"), "idle")
+    sy     = _safe_int(state.get("start_year", START_YEAR), START_YEAR)
+    ey     = max(sy, _safe_int(state.get("end_year", END_YEAR), END_YEAR))
+    cy     = _safe_int(state.get("current_year", sy), sy)
+    cm     = min(12, max(1, _safe_int(state.get("current_month", 1), 1)))
+    cd     = min(31, max(1, _safe_int(state.get("current_day", 1), 1)))
+    ci     = max(1, _safe_int(state.get("current_individ", 1), 1))
+    tested = max(0, _safe_int(state.get("total_tested", 0), 0))
+    found  = max(0, _safe_int(state.get("total_found", 0), 0))
+    n_f    = max(0, _safe_int(state.get("total_not_found", 0), 0))
+    errs   = max(0, _safe_int(state.get("total_errors", 0), 0))
+    target = max(0, _safe_int(state.get("target_people", 0), 0))
     target_goal = target if target and target > 0 else TARGET_PEOPLE_DEFAULT
 
     total_space = _total_pnr_space(sy, ey)
@@ -1342,8 +1364,8 @@ def get_status() -> dict:
     pct_done    = round(current_pos / total_space * 100, 2) if total_space else 0
 
     # Phase 0 stats
-    p0_date  = state.get("phase0_date",  "")
-    p0_found = state.get("phase0_found", 0)
+    p0_date  = _safe_str(state.get("phase0_date", ""), "")
+    p0_found = max(0, _safe_int(state.get("phase0_found", 0), 0))
     total_days = (date(ey, 12, 31) - date(sy, 1, 1)).days + 1
     p0_days_done = 0
     p0_pct = 0.0
@@ -1357,14 +1379,14 @@ def get_status() -> dict:
             pass
 
     # Phase 1 stats
-    p1_prefixes = state.get("phase1_prefixes_done", 0)
-    p1_vehicles = state.get("phase1_vehicles", 0)
-    p1_prefix = state.get("phase1_prefix", "")
-    p1_page = state.get("phase1_page", 0)
-    p1_pct      = round(p1_prefixes / TOTAL_PREFIXES * 100, 1) if p1_prefixes else 0
+    p1_prefixes = max(0, _safe_int(state.get("phase1_prefixes_done", 0), 0))
+    p1_vehicles = max(0, _safe_int(state.get("phase1_vehicles", 0), 0))
+    p1_prefix = _safe_str(state.get("phase1_prefix", ""), "")
+    p1_page = max(0, _safe_int(state.get("phase1_page", 0), 0))
+    p1_pct      = round(min(100.0, p1_prefixes / TOTAL_PREFIXES * 100), 1) if p1_prefixes else 0
 
     eta_seconds = None
-    started = state.get("started_at", "")
+    started = _safe_str(state.get("started_at", ""), "")
     if tested > 0 and started:
         try:
             elapsed = (datetime.now() - datetime.fromisoformat(started)).total_seconds()
@@ -1374,7 +1396,7 @@ def get_status() -> dict:
         except Exception:
             pass
 
-    heartbeat_at = state.get("last_progress_at", "") or state.get("updated_at", "")
+    heartbeat_at = _safe_str(state.get("last_progress_at", ""), "") or _safe_str(state.get("updated_at", ""), "")
     heartbeat_age = None
     if heartbeat_at:
         try:
@@ -1382,13 +1404,13 @@ def get_status() -> dict:
         except ValueError:
             heartbeat_age = None
     heartbeat_is_stale = (
-        state.get("status", "idle") == "running"
+        _safe_str(state.get("status", "idle"), "idle") == "running"
         and heartbeat_age is not None
         and heartbeat_age > HEARTBEAT_STALE_SECONDS
     )
 
     running_local = is_running()
-    status = state.get("status", "idle")
+    status = _safe_str(state.get("status", "idle"), "idle")
     has_any_progress = tested > 0 or p1_prefixes > 0 or p0_found > 0
     in_progress_status = status in ("running", "phase0_done", "phase1_done")
     if in_progress_status and not running_local and has_any_progress:
@@ -1398,12 +1420,12 @@ def get_status() -> dict:
     elif running_local:
         runtime_state = "healthy"
     else:
-        runtime_state = state.get("status", "idle")
+        runtime_state = status
 
-    speed_people = float(state.get("speed_people_per_hour", 0) or 0)
-    speed_tested = float(state.get("speed_tested_per_hour", 0) or 0)
+    speed_people = max(0.0, _safe_float(state.get("speed_people_per_hour", 0), 0.0))
+    speed_tested = max(0.0, _safe_float(state.get("speed_tested_per_hour", 0), 0.0))
 
-    p2e_hb_at = state.get("phase2e_last_progress_at", "")
+    p2e_hb_at = _safe_str(state.get("phase2e_last_progress_at", ""), "")
     p2e_hb_age = None
     if p2e_hb_at:
         try:
@@ -1412,31 +1434,31 @@ def get_status() -> dict:
             pass
 
     return {
-        "status":               state.get("status", "idle"),
+        "status":               status,
         "phase":                phase,
         "is_running":           is_running(),
         "parallel_workers":     PARALLEL_WORKERS,
         # Stage barrier
-        "stage_name":           state.get("stage_name", ""),
-        "stage_blockers":       state.get("stage_blockers", ""),
+        "stage_name":           _safe_str(state.get("stage_name", ""), ""),
+        "stage_blockers":       _safe_str(state.get("stage_blockers", ""), ""),
         # Phase 0
         "phase0_date":          p0_date,
         "phase0_found":         p0_found,
         "phase0_pct_done":      p0_pct,
         "phase0_days_done":     p0_days_done,
         "phase0_days_total":    total_days,
-        "phase0_phones":        state.get("phase0_phones", 0),
-        "phase0_status":        state.get("phase0_status", "idle"),
+        "phase0_phones":        max(0, _safe_int(state.get("phase0_phones", 0), 0)),
+        "phase0_status":        _safe_str(state.get("phase0_status", "idle"), "idle"),
         # Phase 2E (Eniro-guided)
-        "phase2e_resolved":     state.get("phase2e_resolved", 0),
-        "phase2e_searched":     state.get("phase2e_searched", 0),
-        "phase2e_status":       state.get("phase2e_status", "idle"),
+        "phase2e_resolved":     max(0, _safe_int(state.get("phase2e_resolved", 0), 0)),
+        "phase2e_searched":     max(0, _safe_int(state.get("phase2e_searched", 0), 0)),
+        "phase2e_status":       _safe_str(state.get("phase2e_status", "idle"), "idle"),
         "phase2e_pending":      db.count_eniro_pending(),
         "phase2e_last_progress_age": p2e_hb_age,
         "phase2e_stall_seconds": PHASE2E_STALL_SECONDS,
         # Phase 3 (enrichment)
-        "phase3_enriched":      state.get("phase3_enriched", 0),
-        "phase3_phones":        state.get("phase3_phones", 0),
+        "phase3_enriched":      max(0, _safe_int(state.get("phase3_enriched", 0), 0)),
+        "phase3_phones":        max(0, _safe_int(state.get("phase3_phones", 0), 0)),
         "phase3_unenriched":    db.count_unenriched(),
         # Phase 1
         "phase1_prefixes_done": p1_prefixes,
@@ -1445,7 +1467,7 @@ def get_status() -> dict:
         "phase1_prefix":        p1_prefix,
         "phase1_page":          p1_page,
         "phase1_vehicles":      p1_vehicles,
-        "phase1_status":        state.get("phase1_status", "idle"),
+        "phase1_status":        _safe_str(state.get("phase1_status", "idle"), "idle"),
         # Phase 2
         "start_year":           sy,
         "end_year":             ey,
@@ -1471,7 +1493,7 @@ def get_status() -> dict:
         "runtime_state":        runtime_state,
         "heartbeat_stale_after_seconds": HEARTBEAT_STALE_SECONDS,
         "started_at":           started,
-        "updated_at":           state.get("updated_at", ""),
+        "updated_at":           _safe_str(state.get("updated_at", ""), ""),
     }
 
 

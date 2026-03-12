@@ -218,9 +218,15 @@ def status(_: Auth) -> dict:
     }
 
     # Rolling speed metrics are persisted so ETA survives container redeploys.
-    snap = db.update_status_snapshot(total_people, int(s.get("total_tested", 0)))
-    s["speed_people_per_hour"] = float(snap.get("speed_people_per_hour", s.get("speed_people_per_hour", 0)) or 0)
-    s["speed_tested_per_hour"] = float(snap.get("speed_tested_per_hour", s.get("speed_tested_per_hour", 0)) or 0)
+    # If the DB is temporarily locked, keep serving /status with the last known values.
+    try:
+        snap = db.update_status_snapshot(total_people, int(s.get("total_tested", 0)))
+        s["speed_people_per_hour"] = float(snap.get("speed_people_per_hour", s.get("speed_people_per_hour", 0)) or 0)
+        s["speed_tested_per_hour"] = float(snap.get("speed_tested_per_hour", s.get("speed_tested_per_hour", 0)) or 0)
+    except Exception as exc:
+        log.warning("Status snapshot fallback: %s", exc)
+        s["speed_people_per_hour"] = float(s.get("speed_people_per_hour", 0) or 0)
+        s["speed_tested_per_hour"] = float(s.get("speed_tested_per_hour", 0) or 0)
 
     target_goal = int(s.get("target_people_goal", 0) or 0)
     if target_goal > 0:
