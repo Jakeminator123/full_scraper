@@ -21,6 +21,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import signal
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -129,6 +130,40 @@ def health() -> dict:
     return {"ok": True, "service": "full-scraper"}
 
 
+def _disk_debug() -> dict:
+    """Check whether /var/data is a real persistent mount or ephemeral."""
+    data_dir = db.DATA_DIR
+    try:
+        root_stat = os.stat("/")
+        data_stat = os.stat(data_dir)
+        is_mount = root_stat.st_dev != data_stat.st_dev
+    except OSError:
+        is_mount = None
+
+    try:
+        usage = shutil.disk_usage(data_dir)
+        disk_total_gb = round(usage.total / (1024**3), 2)
+        disk_used_gb = round(usage.used / (1024**3), 2)
+        disk_free_gb = round(usage.free / (1024**3), 2)
+    except OSError:
+        disk_total_gb = disk_used_gb = disk_free_gb = None
+
+    try:
+        files = os.listdir(data_dir)
+    except OSError:
+        files = []
+
+    return {
+        "data_dir": data_dir,
+        "db_path": db.DB_PATH,
+        "is_separate_mount": is_mount,
+        "disk_total_gb": disk_total_gb,
+        "disk_used_gb": disk_used_gb,
+        "disk_free_gb": disk_free_gb,
+        "files_in_data_dir": files,
+    }
+
+
 @app.get("/diag", tags=["meta"])
 def diagnostics_public() -> dict:
     """Quick diagnostics — no auth required. Safe to bookmark/webhook."""
@@ -160,6 +195,7 @@ def diagnostics_public() -> dict:
         "phase": phase,
         "run_mode": state.get("run_mode", "standard") or "standard",
         "people_first": (state.get("run_mode", "standard") or "standard") == "people_first",
+        "people_plus_phone": (state.get("run_mode", "standard") or "standard") == "people_plus_phone",
         "skip_phase0": bool(int(state.get("skip_phase0", 0) or 0)),
         "skip_phase1": bool(int(state.get("skip_phase1", 0) or 0)),
         "skip_phase2e": bool(int(state.get("skip_phase2e", 0) or 0)),
@@ -196,6 +232,7 @@ def diagnostics_public() -> dict:
         "db_size_mb": round(db.db_file_size_mb(), 1),
         "parallel_workers": scraper.PARALLEL_WORKERS,
         "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "disk_debug": _disk_debug(),
     }
 
 
@@ -375,6 +412,7 @@ def job_start(
     start_year:  int  = Query(None,  ge=1900, le=2010, description="Override START_YEAR"),
     end_year:    int  = Query(None,  ge=1900, le=2010, description="Override END_YEAR"),
     people_first: bool = Query(False,                description="Prioritise pnr + namn + stad by skipping secondary phases where possible"),
+    people_plus_phone: bool = Query(False,           description="Prioritise pnr + namn + stad first, then telefonnummer via Ratsit enrichment"),
     skip_phase0: bool = Query(False,                   description="Skip Ratsit date-harvesting (Phase 0)"),
     skip_phase1: bool = Query(False,                   description="Skip vehicle prefix enumeration (Phase 1)"),
     skip_phase2e: bool = Query(False,                  description="Skip Eniro-guided resolver (Phase 2E)"),
@@ -385,6 +423,7 @@ def job_start(
 
     options = scraper.normalize_run_options(
         people_first=people_first,
+        people_plus_phone=people_plus_phone,
         skip_phase0=skip_phase0,
         skip_phase1=skip_phase1,
         skip_phase2e=skip_phase2e,
@@ -393,6 +432,7 @@ def job_start(
     ok = scraper.start(target=target, start_year=start_year,
                        end_year=end_year,
                        people_first=bool(options["people_first"]),
+                       people_plus_phone=bool(options["people_plus_phone"]),
                        skip_phase1=bool(options["skip_phase1"]),
                        skip_phase0=bool(options["skip_phase0"]),
                        skip_phase2e=bool(options["skip_phase2e"]),
@@ -404,6 +444,7 @@ def job_start(
         "started": True,
         "run_mode": options["run_mode"],
         "people_first": options["people_first"],
+        "people_plus_phone": options["people_plus_phone"],
         "target": target,
         "target_goal": target if target > 0 else scraper.TARGET_PEOPLE_DEFAULT,
         "skip_phase0": options["skip_phase0"],

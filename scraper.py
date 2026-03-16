@@ -90,27 +90,45 @@ def _safe_str(value, default: str = "") -> str:
 def normalize_run_options(
     *,
     people_first: bool = False,
+    people_plus_phone: bool = False,
     skip_phase0: bool = False,
     skip_phase1: bool = False,
     skip_phase2e: bool = False,
     skip_phase3: bool = False,
 ) -> dict[str, bool | str]:
-    if people_first:
+    if people_plus_phone:
+        skip_phase1 = True
+        skip_phase2e = True
+        skip_phase3 = False
+        people_first = False
+    elif people_first:
         skip_phase1 = True
         skip_phase2e = True
         skip_phase3 = True
 
+    inferred_people_plus_phone = (
+        not skip_phase0
+        and skip_phase1
+        and skip_phase2e
+        and not skip_phase3
+    )
     inferred_people_first = (
         not skip_phase0
         and skip_phase1
         and skip_phase2e
         and skip_phase3
     )
-    run_mode = "people_first" if (people_first or inferred_people_first) else "standard"
+    if people_plus_phone or inferred_people_plus_phone:
+        run_mode = "people_plus_phone"
+    elif people_first or inferred_people_first:
+        run_mode = "people_first"
+    else:
+        run_mode = "standard"
 
     return {
         "run_mode": run_mode,
         "people_first": run_mode == "people_first",
+        "people_plus_phone": run_mode == "people_plus_phone",
         "skip_phase0": bool(skip_phase0),
         "skip_phase1": bool(skip_phase1),
         "skip_phase2e": bool(skip_phase2e),
@@ -1364,7 +1382,8 @@ def _run(start_year: int, end_year: int, target: int,
 def start(target: int = 0, start_year: int | None = None,
           end_year: int | None = None, skip_phase1: bool = False,
           skip_phase0: bool = False, skip_phase2e: bool = False,
-          skip_phase3: bool = False, people_first: bool = False) -> bool:
+          skip_phase3: bool = False, people_first: bool = False,
+          people_plus_phone: bool = False) -> bool:
     global _thread
     with _state_lock:
         if _thread is not None and _thread.is_alive():
@@ -1372,6 +1391,7 @@ def start(target: int = 0, start_year: int | None = None,
         _stop_event.clear()
         options = normalize_run_options(
             people_first=people_first,
+            people_plus_phone=people_plus_phone,
             skip_phase0=skip_phase0,
             skip_phase1=skip_phase1,
             skip_phase2e=skip_phase2e,
@@ -1536,6 +1556,7 @@ def get_status() -> dict:
         "is_running":           is_running(),
         "run_mode":             run_mode,
         "people_first":         run_mode == "people_first",
+        "people_plus_phone":    run_mode == "people_plus_phone",
         "skip_phase0":          skip_phase0,
         "skip_phase1":          skip_phase1,
         "skip_phase2e":         skip_phase2e,
@@ -1632,4 +1653,5 @@ def maybe_auto_resume() -> None:
             skip_phase2e=bool(_safe_int(state.get("skip_phase2e", 0), 0)),
             skip_phase3=bool(_safe_int(state.get("skip_phase3", 0), 0)),
             people_first=run_mode == "people_first",
+            people_plus_phone=run_mode == "people_plus_phone",
         )
