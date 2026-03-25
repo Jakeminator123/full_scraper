@@ -208,7 +208,7 @@
       <button class="btn btn-primary" id="btn-start" onclick="doStart()">Starta jobb</button>
       <button class="btn" id="btn-stop" onclick="doStop()">Pausa</button>
       <button class="btn btn-danger" onclick="doReset()">Reset DB</button>
-      <button class="btn" onclick="window.open('/diag','_blank')" style="border-color:var(--cyan);color:var(--cyan)">Diagnostik</button>
+      <button class="btn" onclick="openDiag()" style="border-color:var(--cyan);color:var(--cyan)">Diagnostik</button>
     </div>
     <h3 style="margin-top:16px">Ladda ned databasen</h3>
     <div class="actions">
@@ -264,27 +264,79 @@
   </div>
 </div>
 
-<footer>full_scraper dashboard — polling var 5:e sekund · serverad direkt från Docker</footer>
+<footer id="dash-footer">full_scraper dashboard</footer>
 
 <script>
+/** True on *.vercel.app or localhost?proxy=1 — uses /api proxy + x-dashboard-auth */
+function vercelProxyMode() {
+  try {
+    const h = location.hostname || "";
+    if (h.endsWith(".vercel.app")) return true;
+    if (h === "localhost" || h === "127.0.0.1") {
+      return new URLSearchParams(location.search).get("proxy") === "1";
+    }
+  } catch {}
+  return false;
+}
+
+const USE_PROXY = vercelProxyMode();
+const API_PREFIX = USE_PROXY ? "/api" : "";
+
+function apiUrl(path) {
+  return API_PREFIX + path;
+}
+
+function openDiag() {
+  window.open(apiUrl("/diag"), "_blank", "noopener,noreferrer");
+}
+
 let pieChart = null;
 let prevSnapshot = null;
 let prevTime = null;
 let apiKey = sessionStorage.getItem("dash_apikey") || "";
+let dashPw = sessionStorage.getItem("dash_pw") || "";
 let lastOkStatus = null;
+
+function applyLoginHints() {
+  if (!USE_PROXY) return;
+  const h = document.querySelector("#login-gate h3");
+  const inp = document.getElementById("pw-input");
+  const err = document.getElementById("pw-error");
+  if (h) h.textContent = "Dashboard-lösenord";
+  if (inp) inp.placeholder = "Vercel DASHBOARD_PASSWORD";
+  if (err) err.textContent = "Fel lösenord";
+}
+applyLoginHints();
+
+function hasAuth() {
+  return USE_PROXY ? !!dashPw : !!apiKey;
+}
 
 function tryLogin() {
   const v = document.getElementById("pw-input").value;
   if (!v) return;
-  apiKey = v;
-  sessionStorage.setItem("dash_apikey", v);
+  if (USE_PROXY) {
+    dashPw = v;
+    sessionStorage.setItem("dash_pw", v);
+  } else {
+    apiKey = v;
+    sessionStorage.setItem("dash_apikey", v);
+  }
   document.getElementById("login-gate").style.display = "none";
   startPolling();
 }
 document.getElementById("pw-input").addEventListener("keydown", e => {
   if (e.key === "Enter") tryLogin();
 });
-if (apiKey) document.getElementById("login-gate").style.display = "none";
+if (hasAuth()) document.getElementById("login-gate").style.display = "none";
+
+(function () {
+  const foot = document.getElementById("dash-footer");
+  if (!foot) return;
+  foot.textContent = USE_PROXY
+    ? "full_scraper dashboard — Vercel proxy → Render API (se repo full-scraper-dashboard)"
+    : "full_scraper dashboard — polling 5 s · serveras från samma värd som API";
+})();
 
 function fmt(n) { return n != null ? n.toLocaleString("sv-SE") : "—"; }
 
@@ -299,14 +351,38 @@ function logMsg(msg, cls="") {
 }
 
 async function fetchApi(path, opts={}) {
-  const headers = { ...(opts.headers || {}), "Authorization": `Bearer ${apiKey}` };
-  const r = await fetch(path, { ...opts, headers });
+  const headers = { ...(opts.headers || {}) };
+  if (USE_PROXY) {
+    headers["x-dashboard-auth"] = dashPw;
+  } else {
+    headers["Authorization"] = `Bearer ${apiKey}`;
+  }
+  const r = await fetch(apiUrl(path), { ...opts, headers });
   if (r.status === 401) {
-    sessionStorage.removeItem("dash_apikey");
-    apiKey = "";
-    document.getElementById("login-gate").style.display = "flex";
-    document.getElementById("pw-error").style.display = "block";
-    throw new Error("Unauthorized");
+    const proxyAuth = r.headers.get("x-proxy-auth") || "";
+    if (USE_PROXY && proxyAuth === "dashboard") {
+      sessionStorage.removeItem("dash_pw");
+      dashPw = "";
+      document.getElementById("login-gate").style.display = "flex";
+      document.getElementById("pw-error").style.display = "block";
+      throw new Error("DashboardUnauthorized");
+    }
+    if (!USE_PROXY) {
+      sessionStorage.removeItem("dash_apikey");
+      apiKey = "";
+      document.getElementById("login-gate").style.display = "flex";
+      document.getElementById("pw-error").style.display = "block";
+      throw new Error("Unauthorized");
+    }
+    let detail = "";
+    try {
+      const body = await r.clone().json();
+      detail = String(body?.detail || body?.error || "").toLowerCase();
+    } catch {}
+    if (detail.includes("invalid api key")) {
+      throw new Error("UpstreamUnauthorized");
+    }
+    throw new Error("HTTP 401");
   }
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
@@ -586,7 +662,7 @@ async function updateStatus() {
     }
     paintDashboard(s);
   } catch (e) {
-    if (e.message === "Unauthorized") return;
+    if (e.message === "Unauthorized" || e.message === "DashboardUnauthorized") return;
     if (pollErr) {
       pollErr.style.display = "block";
       pollErr.textContent =
@@ -662,7 +738,10 @@ async function doReset() {
 }
 async function doExport(format) {
   try {
-    const r = await fetch("/export/" + format, { headers: { "Authorization": `Bearer ${apiKey}` } });
+    const headers = USE_PROXY
+      ? { "x-dashboard-auth": dashPw }
+      : { "Authorization": `Bearer ${apiKey}` };
+    const r = await fetch(apiUrl("/export/" + format), { headers });
     if (!r.ok) { logMsg("Exportfel: HTTP " + r.status, "log-err"); return; }
     const blob = await r.blob();
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob);

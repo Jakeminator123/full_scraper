@@ -4,6 +4,10 @@ Self-contained Docker service that scrapes the **full Swedish population registe
 
 Covers all people — including those without vehicles (~60% of the population).
 
+**Dashboard:** The same UI ships as [`dashboard.html`](dashboard.html) from this API (e.g. open `/` on Render). A **Vercel-hosted** copy lives in the sibling repo [**full-scraper-dashboard**](https://github.com/Jakeminator123/full-scraper-dashboard) (`full-scraper-dashboard.vercel.app`) and proxies to Render so the browser never holds your `API_KEY`. The HTML auto-detects `*.vercel.app` vs same-origin.
+
+**Alerts / webhooks:** See [`docs/ALERTS.md`](docs/ALERTS.md) (Render notifications, deploy hooks, optional uptime checks on `/health` or `/diag`).
+
 ## Quick start
 
 ```bash
