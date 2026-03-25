@@ -8,10 +8,6 @@ Det finns **ingen inbyggd** “varsel-webhook” i själva scraper-koden som ski
 - **Deploy webhook:** I tjänstens inställningar kan du ofta lägga en **outgoing webhook** vid lyckad/misslyckad deploy (beroende på Render-plan och UI).
 - **OOM / krascher:** Övervaka **Events**-loggen; kombinera med notifieringar om du vill ha push vid instansfel.
 
-## Vercel (dashboard)
-
-- **Deploy:** [Vercel → Project → Settings → Git → Deploy Hooks](https://vercel.com/docs/deploy-hooks) eller integrerade notifieringar vid failed production deploy.
-
 ## Uptime / “är API levande?”
 
 - Pinga **`GET /health`** (ingen auth) eller **`GET /diag`** (ingen auth) med t.ex. [healthchecks.io](https://healthchecks.io), UptimeRobot eller liknande.
@@ -19,4 +15,4 @@ Det finns **ingen inbyggd** “varsel-webhook” i själva scraper-koden som ski
 
 ## Säkerhet
 
-- Lägg **aldrig** riktiga API-nycklar eller `DASHBOARD_PASSWORD` i frontend-repot. På Vercel ska `SCRAPER_API_KEY` och `DASHBOARD_PASSWORD` bara finnas som **environment variables**.
+- **`API_KEY`** ska bara finnas som miljövariabel på servern (Render). Webbläsaren lagrar den **endast i `sessionStorage`** när du använder inbyggda dashboarden på samma host — dela inte länkar med inbäddad nyckel.

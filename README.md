@@ -4,9 +4,11 @@ Self-contained Docker service that scrapes the **full Swedish population registe
 
 Covers all people — including those without vehicles (~60% of the population).
 
-**Dashboard:** The same UI ships as [`dashboard.html`](dashboard.html) from this API (e.g. open `/` on Render). A **Vercel-hosted** copy lives in the sibling repo [**full-scraper-dashboard**](https://github.com/Jakeminator123/full-scraper-dashboard) (`full-scraper-dashboard.vercel.app`) and proxies to Render so the browser never holds your `API_KEY`. The HTML auto-detects `*.vercel.app` vs same-origin.
+**Dashboard:** Open **`GET /`** on the same host as the API (e.g. your Render URL). The UI is [`dashboard.html`](dashboard.html); log in with your `API_KEY` (stored in `sessionStorage` in the browser only for that session).
 
-**Alerts / webhooks:** See [`docs/ALERTS.md`](docs/ALERTS.md) (Render notifications, deploy hooks, optional uptime checks on `/health` or `/diag`).
+**Deploy / monorepo:** If you use `alla-skrapningsprojekt` with a **git submodule** for this service, read [`docs/DEPLOY.md`](docs/DEPLOY.md) so Render’s branch and the parent repo’s submodule pointer stay aligned.
+
+**Alerts / webhooks:** See [`docs/ALERTS.md`](docs/ALERTS.md) (Render notifications, optional uptime checks on `/health` or `/diag`).
 
 ## Quick start
 
@@ -29,11 +31,15 @@ curl -H "Authorization: Bearer test123" http://localhost:8080/status
 
 ## Deploy to Render
 
+Render builds **this repository** (e.g. `Jakeminator123/full_scraper`), branch **`main`** unless you change it in the Render UI — not the parent monorepo root.
+
 1. Copy `render.yaml` to the root of your full_scraper git repo
 2. `git push`
 3. Render dashboard: New -> Blueprint -> select repo
 4. Find auto-generated `API_KEY` in Render Environment tab
 5. Keep `DATA_DIR=/var/data` aligned with the disk `mountPath` (see `render.yaml`)
+
+Details: [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 **Manual environment variables (no Blueprint):** If you create the service by hand and set variables only in the Render **Environment** tab, those values override both `render.yaml` (when not using Blueprint) and Docker `ENV` in the image. Set at least `API_KEY`, `DATA_DIR=/var/data`, and `PARALLEL_WORKERS=4` (for ~4 GB RAM) to match safe defaults.
 
