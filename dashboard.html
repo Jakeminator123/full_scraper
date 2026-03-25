@@ -88,11 +88,14 @@
 <div id="login-gate" style="position:fixed;inset:0;z-index:9999;background:var(--bg);
   display:flex;align-items:center;justify-content:center">
   <div class="card" style="width:340px;text-align:center">
-    <h3>API-nyckel</h3>
-    <input id="pw-input" type="password" placeholder="Bearer API_KEY"
-      style="width:100%;padding:10px 14px;margin:12px 0;border-radius:8px;border:1px solid var(--border);
-      background:var(--bg);color:var(--text);font-size:14px;text-align:center">
-    <button class="btn btn-primary" style="width:100%" onclick="tryLogin()">Logga in</button>
+    <form id="login-form" style="margin:0" onsubmit="event.preventDefault(); tryLogin();" autocomplete="on">
+      <h3>API-nyckel</h3>
+      <input id="pw-input" name="api_key" type="password" placeholder="Bearer API_KEY"
+        autocomplete="current-password"
+        style="width:100%;padding:10px 14px;margin:12px 0;border-radius:8px;border:1px solid var(--border);
+        background:var(--bg);color:var(--text);font-size:14px;text-align:center">
+      <button class="btn btn-primary" type="submit" style="width:100%">Logga in</button>
+    </form>
     <div id="pw-error" style="color:var(--red);font-size:12px;margin-top:8px;display:none">Fel API-nyckel</div>
   </div>
 </div>
@@ -412,7 +415,8 @@ function buildMainStatusText(s) {
 
 function paintDashboard(s) {
     const status = s.status || "idle";
-    const running = s.is_running;
+    const threadAlive = !!s.is_running;
+    const dbSaysJobActive = ["running", "phase0_done", "phase1_done"].includes(status);
 
     const dot = document.getElementById("status-dot");
     const dotCls = {running:"dot-running",paused:"dot-paused",
@@ -427,9 +431,16 @@ function paintDashboard(s) {
       warn.textContent = `Varning: ingen progress på ${fmt(s.heartbeat_age_seconds)}s.`;
     } else { warn.style.display = "none"; }
 
-    document.getElementById("btn-start").disabled = running;
-    document.getElementById("btn-start").textContent = running ? "Kör..." : "Starta jobb";
-    document.getElementById("btn-stop").disabled = !running;
+    const staleRunning = dbSaysJobActive && !threadAlive;
+    const startBtn = document.getElementById("btn-start");
+    const stopBtn = document.getElementById("btn-stop");
+    startBtn.disabled = threadAlive;
+    startBtn.textContent = threadAlive
+      ? "Kör..."
+      : staleRunning
+        ? "Återuppta jobb"
+        : "Starta jobb";
+    stopBtn.disabled = !(threadAlive || dbSaysJobActive);
 
     const people = s.total_people_in_db || 0;
     const withV = s.people_with_vehicles || 0;

@@ -495,7 +495,16 @@ def job_reset(_: Auth) -> dict:
 
 @app.post("/job/stop", tags=["job"])
 def job_stop(_: Auth) -> dict:
-    if not scraper.is_running():
-        return {"stopped": False, "detail": "Scraper was not running."}
-    scraper.stop()
-    return {"stopped": True, "detail": "Stop signal sent. Job will pause after current batch."}
+    if scraper.is_running():
+        scraper.stop()
+        return {"stopped": True, "detail": "Stop signal sent. Job will pause after current batch."}
+    state = db.get_job_state()
+    status = str(state.get("status", "idle") or "idle")
+    if status in ("running", "phase0_done", "phase1_done"):
+        now = datetime.now().isoformat(timespec="seconds")
+        db.update_job_state(status="paused", updated_at=now)
+        return {
+            "stopped": True,
+            "detail": "Ingen aktiv tråd; job_state satt till paused (SQLite hade fortfarande aktiv status).",
+        }
+    return {"stopped": False, "detail": "Scraper was not running."}
