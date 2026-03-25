@@ -49,7 +49,10 @@ RATSIT_JS        = os.path.join(APP_DIR, "ratsit_helper.js")
 PAGE_PAUSE       = float(os.environ.get("PAGE_PAUSE",       "0.5"))
 PHASE0_PAUSE     = float(os.environ.get("PHASE0_PAUSE",     "1.5"))
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE",         "25"))
-PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "6"))
+# Default 4: Playwright × workers stacks quickly; Render ~4 GB RAM OOMs above ~6 workers.
+PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS",   "4"))
+# Rough Phase 0 ETA: seconds per calendar day still to scan (2 genders × Ratsit); see ARCHITECTURE.md.
+PHASE0_ETA_SEC_PER_DAY = int(os.environ.get("PHASE0_ETA_SEC_PER_DAY", "600"))
 START_YEAR       = int(os.environ.get("START_YEAR",         "1940"))
 END_YEAR         = int(os.environ.get("END_YEAR",           "2005"))
 TARGET_PEOPLE_DEFAULT = int(os.environ.get("TARGET_PEOPLE_DEFAULT", "10400000"))
@@ -1212,6 +1215,28 @@ def _run_phase3() -> None:
     log.info("Phase 3 done/paused: %d enriched, %d phones", enriched, phones)
 
 
+def _compute_phase2_parallel_workers(
+    original_workers: int,
+    *,
+    phase1_still_alive: bool,
+    phase2e_alive: bool,
+    phase0_alive: bool,
+) -> int:
+    """How many Phase 2 Chromium workers to use without exceeding the env cap.
+
+    Older logic used max(original, 8), which pushed PARALLEL_WORKERS=4 up to 8 and
+    caused OOM on ~4 GB hosts. We never go above original_workers (from env).
+    """
+    ow = max(1, int(original_workers))
+    if phase1_still_alive:
+        return max(2, min(ow, 4))
+    if phase2e_alive:
+        return max(2, min(ow, 6))
+    if phase0_alive:
+        return max(2, min(ow, 8))
+    return max(2, ow)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Main run loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1228,7 +1253,7 @@ def _run(start_year: int, end_year: int, target: int,
       Phase 2E (Eniro PNR resolver, 1 Chromium, ~400 MB)
 
     Stage 2 — full-power brute-force (~2.5 GB):
-      Phase 2  (PNR enumeration, 8 workers, gets all remaining RAM)
+      Phase 2  (PNR enumeration, PARALLEL_WORKERS Chromiums)
 
     Stage 3 — enrichment:
       Phase 3  (Ratsit enrichment, 1 Chromium, after Phase 2)
@@ -1323,29 +1348,41 @@ def _run(start_year: int, end_year: int, target: int,
         original_workers = PARALLEL_WORKERS
         bg_alive_names = {t.name for t in bg_threads if t.is_alive()}
         bg_alive = len(bg_alive_names)
-        phase1_still_alive = phase1_thread_ref and phase1_thread_ref.is_alive()
+        phase1_still_alive = bool(phase1_thread_ref and phase1_thread_ref.is_alive())
         phase0_alive = "phase0" in bg_alive_names
         phase2e_alive = "phase2e" in bg_alive_names
+        PARALLEL_WORKERS = _compute_phase2_parallel_workers(
+            original_workers,
+            phase1_still_alive=phase1_still_alive,
+            phase2e_alive=phase2e_alive,
+            phase0_alive=phase0_alive,
+        )
         if phase1_still_alive:
-            PARALLEL_WORKERS = max(2, min(original_workers, 4))
-            log.info("Phase 2 starting with %d workers (Phase 1 still running after barrier timeout)",
-                     PARALLEL_WORKERS)
+            log.info(
+                "Phase 2 starting with %d workers (Phase 1 still running after barrier timeout; cap was %d)",
+                PARALLEL_WORKERS,
+                original_workers,
+            )
         elif phase2e_alive:
-            PARALLEL_WORKERS = max(original_workers, 6)
-            log.info("Phase 2 starting with %d workers (Phase 2E still alive; %d bg threads total)",
-                     PARALLEL_WORKERS, bg_alive)
+            log.info(
+                "Phase 2 starting with %d workers (Phase 2E still alive; %d bg threads; cap %d)",
+                PARALLEL_WORKERS,
+                bg_alive,
+                original_workers,
+            )
         elif phase0_alive:
-            PARALLEL_WORKERS = max(original_workers, 8)
-            if run_mode == "people_first":
-                log.info("Phase 2 starting with %d workers (people-first mode; only Phase 0 still alive)",
-                         PARALLEL_WORKERS)
-            else:
-                log.info("Phase 2 starting with %d workers (only Phase 0 still alive)",
-                         PARALLEL_WORKERS)
+            log.info(
+                "Phase 2 starting with %d workers (%s; Phase 0 still alive; cap %d)",
+                PARALLEL_WORKERS,
+                "people-first" if run_mode == "people_first" else "standard",
+                original_workers,
+            )
         else:
-            PARALLEL_WORKERS = max(original_workers, 8)
-            log.info("Phase 2 starting with %d workers (all Stage 1 done)",
-                     PARALLEL_WORKERS)
+            log.info(
+                "Phase 2 starting with %d workers (all Stage 1 done; cap %d)",
+                PARALLEL_WORKERS,
+                original_workers,
+            )
 
         if not _stop_event.is_set():
             _run_phase2(start_year, end_year, target)
@@ -1444,6 +1481,44 @@ def is_running() -> bool:
     return _thread is not None and _thread.is_alive()
 
 
+def _bottleneck_hint_sv(
+    *,
+    status: str,
+    stage_name: str,
+    skip_phase0: bool,
+    skip_phase1: bool,
+    skip_phase2e: bool,
+    p0_pct: float,
+    p1_pct: float,
+    phase2_pct: float,
+    phase2e_status: str,
+    heartbeat_is_stale: bool,
+) -> str:
+    """Short Swedish hint for dashboard; heuristic only (see ARCHITECTURE.md)."""
+    if heartbeat_is_stale and status == "running":
+        return "Varning: ingen progress på länge — kontrollera loggar och ev. Cloudflare."
+    if status not in ("running", "phase0_done", "phase1_done"):
+        return ""
+    if stage_name == "stage2" or (phase2_pct > 0 and phase2_pct < 99.5):
+        return "Primär flaskhals: Fas 2 (PNR brute-force → biluppgifter) — styr väggtid för personregister."
+    if stage_name == "stage1":
+        parts: list[str] = []
+        if not skip_phase0 and p0_pct < 100.0:
+            parts.append("Fas 0 (Ratsit) är sekventiell")
+        if not skip_phase1 and p1_pct < 100.0:
+            parts.append("Fas 1 (fordon) delar sajt-tak med Fas 2")
+        if not skip_phase2e and phase2e_status == "running":
+            parts.append(
+                "Fas 2E (Eniro) är liten volym och är sällan flaskhals jämfört med Fas 2 PNR"
+            )
+        if parts:
+            return "Parallellt: " + " · ".join(parts) + ". Fas 2 PNR tar över som dominerande i steg 2."
+        return "Övergång mot Fas 2 eller väntar barriär."
+    if stage_name == "stage3":
+        return "Fas 3 (Ratsit-berikning) begränsas av antal kvarvarande poster och Ratsit-takt."
+    return ""
+
+
 def get_status() -> dict:
     state  = db.get_job_state()
     now    = datetime.now()
@@ -1524,6 +1599,25 @@ def get_status() -> dict:
         _safe_str(state.get("status", "idle"), "idle") == "running"
         and heartbeat_age is not None
         and heartbeat_age > HEARTBEAT_STALE_SECONDS
+    )
+
+    eta_phase0_seconds_rough = None
+    if not skip_phase0 and p0_pct < 100.0 and total_days > 0:
+        rem_days = max(0, total_days - p0_days_done)
+        eta_phase0_seconds_rough = rem_days * PHASE0_ETA_SEC_PER_DAY
+
+    stage_nm = _safe_str(state.get("stage_name", ""), "")
+    bottleneck_hint_sv = _bottleneck_hint_sv(
+        status=_safe_str(state.get("status", "idle"), "idle"),
+        stage_name=stage_nm,
+        skip_phase0=skip_phase0,
+        skip_phase1=skip_phase1,
+        skip_phase2e=skip_phase2e,
+        p0_pct=p0_pct,
+        p1_pct=p1_pct,
+        phase2_pct=pct_done,
+        phase2e_status=_safe_str(state.get("phase2e_status", "idle"), "idle"),
+        heartbeat_is_stale=heartbeat_is_stale,
     )
 
     running_local = is_running()
@@ -1610,6 +1704,9 @@ def get_status() -> dict:
         "db_size_mb":           round(db.db_file_size_mb(), 1),
         "eta_seconds":          eta_seconds,
         "eta_phase2_seconds":   eta_seconds,
+        "eta_phase0_seconds_rough": eta_phase0_seconds_rough,
+        "phase0_eta_sec_per_day": PHASE0_ETA_SEC_PER_DAY,
+        "bottleneck_hint_sv":   bottleneck_hint_sv,
         "speed_people_per_hour": speed_people,
         "speed_tested_per_hour": speed_tested,
         "heartbeat_at":         heartbeat_at,

@@ -20,9 +20,12 @@ import csv
 import io
 import json
 import logging
+import math
 import os
 import shutil
 import signal
+import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Annotated
@@ -238,38 +241,46 @@ def diagnostics_public() -> dict:
 
 # ── Status ────────────────────────────────────────────────────────────────────
 
-@app.get("/status", tags=["job"])
-def status(_: Auth) -> dict:
+def _enrichment_counts_clean(raw: dict) -> dict[str, int]:
+    """SQLite SUM() can be NULL; JSON clients prefer integers."""
+    keys = (
+        "med_telefon", "med_kon", "med_gift", "med_gps", "med_bolag",
+        "med_tilltalsnamn", "med_grannar", "fran_ratsit", "fran_biluppgifter",
+    )
+    return {k: int(raw.get(k) or 0) for k in keys}
+
+
+def _finite_float(v: object, default: float = 0.0) -> float:
+    try:
+        f = float(v if v is not None else default)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
+def _build_status_payload() -> dict:
     s = scraper.get_status()
     total_people = db.count_people()
-    s["total_people_in_db"]      = total_people
-    s["people_with_vehicles"]    = db.count_people(har_fordon=1)
+    s["total_people_in_db"] = total_people
+    s["people_with_vehicles"] = db.count_people(har_fordon=1)
     s["people_without_vehicles"] = db.count_people(har_fordon=0)
-    s["total_vehicles_in_db"]    = db.count_vehicles()
+    s["total_vehicles_in_db"] = db.count_vehicles()
 
-    enrichment = db.count_enrichment()
-    s["enrichment"] = {
-        "med_telefon":      enrichment.get("med_telefon", 0),
-        "med_kon":          enrichment.get("med_kon", 0),
-        "med_gift":         enrichment.get("med_gift", 0),
-        "med_gps":          enrichment.get("med_gps", 0),
-        "med_bolag":        enrichment.get("med_bolag", 0),
-        "med_tilltalsnamn": enrichment.get("med_tilltalsnamn", 0),
-        "med_grannar":      enrichment.get("med_grannar", 0),
-        "fran_ratsit":      enrichment.get("fran_ratsit", 0),
-        "fran_biluppgifter": enrichment.get("fran_biluppgifter", 0),
-    }
+    s["enrichment"] = _enrichment_counts_clean(db.count_enrichment())
 
     # Rolling speed metrics are persisted so ETA survives container redeploys.
-    # If the DB is temporarily locked, keep serving /status with the last known values.
     try:
         snap = db.update_status_snapshot(total_people, int(s.get("total_tested", 0)))
-        s["speed_people_per_hour"] = float(snap.get("speed_people_per_hour", s.get("speed_people_per_hour", 0)) or 0)
-        s["speed_tested_per_hour"] = float(snap.get("speed_tested_per_hour", s.get("speed_tested_per_hour", 0)) or 0)
+        s["speed_people_per_hour"] = _finite_float(
+            snap.get("speed_people_per_hour", s.get("speed_people_per_hour", 0))
+        )
+        s["speed_tested_per_hour"] = _finite_float(
+            snap.get("speed_tested_per_hour", s.get("speed_tested_per_hour", 0))
+        )
     except Exception as exc:
         log.warning("Status snapshot fallback: %s", exc)
-        s["speed_people_per_hour"] = float(s.get("speed_people_per_hour", 0) or 0)
-        s["speed_tested_per_hour"] = float(s.get("speed_tested_per_hour", 0) or 0)
+        s["speed_people_per_hour"] = _finite_float(s.get("speed_people_per_hour", 0))
+        s["speed_tested_per_hour"] = _finite_float(s.get("speed_tested_per_hour", 0))
 
     target_goal = int(s.get("target_people_goal", 0) or 0)
     if target_goal > 0:
@@ -278,12 +289,14 @@ def status(_: Auth) -> dict:
         s["people_remaining_to_goal"] = remaining
         s["goal_progress_pct"] = round(min(100.0, (total_people / target_goal) * 100), 2)
 
-        # If rolling speed has not stabilised yet, use average speed since started_at.
-        people_speed = float(s.get("speed_people_per_hour", 0) or 0)
+        people_speed = _finite_float(s.get("speed_people_per_hour", 0))
         if people_speed <= 0 and s.get("started_at"):
             try:
-                elapsed_h = max((now - datetime.fromisoformat(str(s["started_at"]))).total_seconds() / 3600.0, 1e-6)
-                people_speed = total_people / elapsed_h
+                elapsed_h = max(
+                    (now - datetime.fromisoformat(str(s["started_at"]))).total_seconds() / 3600.0,
+                    1e-6,
+                )
+                people_speed = _finite_float(total_people / elapsed_h)
             except (ValueError, TypeError):
                 people_speed = 0.0
         s["speed_people_per_hour"] = round(people_speed, 2)
@@ -305,6 +318,23 @@ def status(_: Auth) -> dict:
         s["eta_at"] = ""
 
     return s
+
+
+@app.get("/status", tags=["job"])
+def status(_: Auth) -> dict:
+    """Many concurrent readers + scraper writes can briefly lock SQLite; retry instead of 500."""
+    last_err: sqlite3.OperationalError | None = None
+    for attempt in range(8):
+        try:
+            return _build_status_payload()
+        except sqlite3.OperationalError as exc:
+            last_err = exc
+            time.sleep(0.05 * (attempt + 1))
+    log.warning("/status: database still locked after retries: %s", last_err)
+    raise HTTPException(
+        status_code=503,
+        detail="Database temporarily busy; retry in a moment.",
+    )
 
 
 # ── Browse ────────────────────────────────────────────────────────────────────

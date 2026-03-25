@@ -109,6 +109,7 @@
 </header>
 
 <div class="warn-box" id="heartbeat-warning"></div>
+<div class="warn-box" id="status-poll-error" style="display:none;border-color:var(--red);color:var(--red)"></div>
 
 <!-- Row 1: Key metrics -->
 <div class="grid" style="grid-template-columns:1fr 1fr">
@@ -135,7 +136,8 @@
     <div class="sub" id="p0-pct" style="margin-top:4px"></div>
   </div>
   <div class="card">
-    <h3>Fas 3 — Ratsit Enrichment</h3>
+    <h3>Fas 3 — Ratsit-berikning</h3>
+    <div class="sub" style="margin:-2px 0 10px">Körs i <b>steg 3</b> efter Fas 2 PNR. Väntar medan Fas 2 fyller personbasen.</div>
     <div class="flex-between">
       <span class="big" style="color:#f97316;font-size:24px" id="p3-enriched">—</span>
       <span class="sub" id="p3-remaining"></span>
@@ -147,7 +149,8 @@
 </div>
 <div class="grid" style="grid-template-columns:1fr 1fr 1fr 1fr">
   <div class="card">
-    <h3>Fas 2E — Eniro Resolver <span class="status-dot" id="p2e-dot"></span></h3>
+    <h3>Fas 2E — Eniro <span class="status-dot" id="p2e-dot"></span></h3>
+    <div class="sub" style="margin:-2px 0 10px">Liten volym · parallellt i steg 1 · sällan flaskhals vs Fas 2 PNR</div>
     <div class="flex-between">
       <span class="big" style="color:var(--green);font-size:22px" id="p2e-resolved">—</span>
       <span class="sub" id="p2e-searched"></span>
@@ -165,7 +168,8 @@
     <div class="sub text-cyan" id="p1-live" style="margin-top:2px;display:none"></div>
   </div>
   <div class="card">
-    <h3>Fas 2 — PNR Brute-force</h3>
+    <h3>Fas 2 — PNR brute-force</h3>
+    <div class="sub" style="margin:-2px 0 10px">biluppgifter.se — styr normalt total tid för personregister (Cloudflare + tak)</div>
     <div class="flex-between">
       <span class="big" style="color:var(--green);font-size:24px" id="p2-found">—</span>
       <span class="sub" id="p2-pos"></span>
@@ -230,6 +234,8 @@
       <div class="kv-item">ETA<b id="g-eta">—</b></div>
     </div>
     <div class="small-note" id="g-eta-at">Beräknad sluttid: —</div>
+    <div class="small-note text-yellow" id="g-bottleneck" style="margin-top:8px;display:none"></div>
+    <div class="small-note text-dim" id="g-eta-p0" style="margin-top:4px"></div>
   </div>
   <div class="card">
     <h3>Datadistribution</h3>
@@ -265,6 +271,7 @@ let pieChart = null;
 let prevSnapshot = null;
 let prevTime = null;
 let apiKey = sessionStorage.getItem("dash_apikey") || "";
+let lastOkStatus = null;
 
 function tryLogin() {
   const v = document.getElementById("pw-input").value;
@@ -391,10 +398,7 @@ function buildMainStatusText(s) {
   return `${status} — ${flow}${blockerTxt}`;
 }
 
-async function updateStatus() {
-  try {
-    const s = await fetchApi("/status");
-    const now = Date.now();
+function paintDashboard(s) {
     const status = s.status || "idle";
     const running = s.is_running;
 
@@ -425,7 +429,11 @@ async function updateStatus() {
       `${fmt(withV)} med fordon · ${fmt(withoutV)} utan · ${fmtSpeed(pSpeed)}`;
     document.getElementById("m-vehicles").textContent = fmt(s.total_vehicles_in_db || 0);
     document.getElementById("m-dbsize").textContent = `${s.db_size_mb || 0} MB`;
-    if (s.eta_seconds != null) document.getElementById("m-eta").textContent = `Fas 2 ETA: ${fmtDuration(s.eta_seconds)}`;
+    const mEta = document.getElementById("m-eta");
+    if (s.eta_seconds != null && s.eta_seconds > 0)
+      mEta.textContent = `Fas 2 ETA: ${fmtDuration(s.eta_seconds)}`;
+    else
+      mEta.textContent = "";
     if (s.started_at) {
       const st = new Date(s.started_at);
       if (!isNaN(st)) document.getElementById("m-uptime").textContent = `Aktiv: ${fmtDuration(Math.floor((Date.now()-st)/1000))}`;
@@ -489,11 +497,11 @@ async function updateStatus() {
     if (showWaiting) {
       const stage = s.stage_name || "";
       const blockers = s.stage_blockers || "";
-      let waitMsg = "Vantar pa Fas 2 (kors forst)";
+      let waitMsg = "Väntar på Fas 2 (körs först)";
       if (stage === "stage1" && blockers)
-        waitMsg = `Vantar: ${labelForStage(stage)} invantar ${labelForBlockers(blockers)}`;
+        waitMsg = `Väntar: ${labelForStage(stage)} inväntar ${labelForBlockers(blockers)}`;
       else if (stage === "stage2")
-        waitMsg = "Vantar: Fas 2 kor just nu";
+        waitMsg = "Väntar: Fas 2 körs just nu";
       p3Waiting.textContent = waitMsg;
       p3Waiting.style.display = "block";
     } else {
@@ -510,7 +518,7 @@ async function updateStatus() {
     if (p2eStatus === "stalled") {
       const age = s.phase2e_last_progress_age;
       document.getElementById("p2e-detail").textContent =
-        `Stallad (${age != null ? Math.round(age/60) + "m utan progress" : "?"}) — Fas 2 startade anda`;
+        `Stallad (${age != null ? Math.round(age/60) + "m utan progress" : "?"}) — Fas 2 PNR kan ändå köra`;
     } else if (p2eStatus === "done") {
       document.getElementById("p2e-detail").textContent = `Klar: ${p2eResolved}/${p2eSearched} matchade`;
     } else if (p2eStatus === "error") {
@@ -544,13 +552,53 @@ async function updateStatus() {
     document.getElementById("g-speed").textContent = fmtSpeed(pSpeed);
     document.getElementById("g-eta").textContent = fmtDuration(s.eta_seconds_to_goal);
     document.getElementById("g-eta-at").textContent = `Beräknad sluttid: ${s.eta_at || "—"}`;
+    const bh = (s.bottleneck_hint_sv || "").trim();
+    const gB = document.getElementById("g-bottleneck");
+    if (bh) {
+      gB.textContent = bh;
+      gB.style.display = "block";
+    } else {
+      gB.textContent = "";
+      gB.style.display = "none";
+    }
+    const gP0 = document.getElementById("g-eta-p0");
+    const p0rough = s.eta_phase0_seconds_rough;
+    const secDay = s.phase0_eta_sec_per_day;
+    if (!s.skip_phase0 && p0rough != null && p0rough > 0 && secDay) {
+      gP0.textContent =
+        `Fas 0 grov ETA (~${secDay}s återstående datum): ${fmtDuration(p0rough)}`;
+    } else {
+      gP0.textContent = "";
+    }
 
     // Pie
     updatePie(withV, withoutV, s.phase0_found || 0);
+}
+
+async function updateStatus() {
+  const pollErr = document.getElementById("status-poll-error");
+  try {
+    const s = await fetchApi("/status");
+    lastOkStatus = s;
+    if (pollErr) {
+      pollErr.style.display = "none";
+      pollErr.textContent = "";
+    }
+    paintDashboard(s);
   } catch (e) {
     if (e.message === "Unauthorized") return;
-    document.getElementById("status-text").textContent = "Offline";
-    document.getElementById("status-dot").className = "status-dot dot-error";
+    if (pollErr) {
+      pollErr.style.display = "block";
+      pollErr.textContent =
+        `/status misslyckades (${e.message}). ` +
+        (lastOkStatus ? "Visar senaste lyckade svar nedan." : "Ingen tidigare status i minnet.");
+    }
+    if (lastOkStatus) {
+      paintDashboard(lastOkStatus);
+    } else {
+      document.getElementById("status-text").textContent = "Offline";
+      document.getElementById("status-dot").className = "status-dot dot-error";
+    }
   }
 }
 

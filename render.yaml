@@ -2,6 +2,10 @@
 #
 # This file lives at the root of the full_scraper git repo.
 # Render dashboard → New → Blueprint → select your repo.
+#
+# Memory: each Playwright/Chromium worker is heavy. On ~4 GB instances, keep
+# PARALLEL_WORKERS at 4 (or lower if OOM). Override only if you upgrade RAM.
+# BATCH_SIZE and PAGE_PAUSE also affect peak memory and Cloudflare pressure.
 
 services:
   - type: web

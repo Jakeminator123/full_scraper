@@ -25,10 +25,39 @@ curl -H "Authorization: Bearer test123" http://localhost:8080/status
 
 ## Deploy to Render
 
-1. Copy `render.yaml` to the root of your git repo
+1. Copy `render.yaml` to the root of your full_scraper git repo
 2. `git push`
 3. Render dashboard: New -> Blueprint -> select repo
 4. Find auto-generated `API_KEY` in Render Environment tab
+5. Keep `DATA_DIR=/var/data` aligned with the disk `mountPath` (see `render.yaml`)
+
+**Manual environment variables (no Blueprint):** If you create the service by hand and set variables only in the Render **Environment** tab, those values override both `render.yaml` (when not using Blueprint) and Docker `ENV` in the image. Set at least `API_KEY`, `DATA_DIR=/var/data`, and `PARALLEL_WORKERS=4` (for ~4 GB RAM) to match safe defaults.
+
+## Goals: what to run (personer vs fordon vs berikning)
+
+Phases are complementary (see `docs/ARCHITECTURE.md`). Pick a **preset** via `POST /job/start` query flags:
+
+| Primary goal | Suggested flags | Effect |
+|--------------|-----------------|--------|
+| **Max personregister** (default mindset) | *(none)* or `people_first=true` | Fas 0 + 1 + 2E in stage 1, then Fas 2; Fas 3 after |
+| **Snabbast möjliga Fas 2-only** | `skip_phase0=true&skip_phase1=true&skip_phase2e=true` | Bara PNR → biluppgifter; längre totalt HTTP mot ogiltiga PNR |
+| **Ingen fordonsdatabas** | `skip_phase1=true` | Spar CPU/RAM och tid om du bara vill ha personer |
+| **Ingen Ratsit-harvest** | `skip_phase0=true` | Allt via Fas 2 brute-force; mer belastning på biluppgifter |
+| **Berikning sist** | `skip_phase3=true` tills Fas 2 är tillräcklig | Undvik onödig Ratsit-trafik innan du har personbas |
+
+Examples:
+
+```bash
+# Full pipeline (typical)
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  "http://localhost:8080/job/start?target=10400000"
+
+# Lean: only people via PNR enumeration
+curl -X POST -H "Authorization: Bearer $API_KEY" \
+  "http://localhost:8080/job/start?target=10400000&skip_phase0=true&skip_phase1=true&skip_phase2e=true"
+```
+
+**Bottleneck (expectation):** Fas 2 (PNR → biluppgifter) usually dominates wall-clock for people coverage; Fas 0 is slow per calendar day but saves Fas 2 work. The dashboard and `GET /status` expose `bottleneck_hint_sv` and a rough `eta_phase0_seconds_rough` for orientation.
 
 ## API
 
@@ -44,6 +73,8 @@ All endpoints except `/health` require `Authorization: Bearer <API_KEY>`.
 | GET | `/export/sqlite` | Download raw SQLite file |
 | POST | `/job/start?target=500000` | Start/resume scraping |
 | POST | `/job/stop` | Pause after current batch |
+
+`POST /job/start` optional query flags: `skip_phase0`, `skip_phase1`, `skip_phase2e`, `skip_phase3`, `people_first`, `people_plus_phone` (see `main.py`).
 
 ### Filters on `/people`
 
@@ -77,7 +108,9 @@ Single instance at 0.5s/req takes ~128 days for full coverage.
 | `START_YEAR` | 1940 | Birth year range start |
 | `END_YEAR` | 2005 | Birth year range end |
 | `PAGE_PAUSE` | 0.5 | Seconds between requests |
-| `BATCH_SIZE` | 20 | URLs per Playwright batch |
+| `BATCH_SIZE` | 25 | URLs per Playwright batch |
+| `PARALLEL_WORKERS` | 4 | Playwright workers (keep ≤4 on ~4 GB RAM) |
+| `PHASE0_ETA_SEC_PER_DAY` | 600 | Rough seconds per remaining calendar day for Fas 0 ETA hint |
 | `AUTO_RESUME` | true | Resume on container restart |
 | `DATA_DIR` | /var/data | SQLite storage directory |
 
